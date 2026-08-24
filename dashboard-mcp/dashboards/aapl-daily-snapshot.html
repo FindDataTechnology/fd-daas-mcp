@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AAPL 日行情快照</title>
+<script src="vendor/echarts.min.js"></script>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 20px; background: #f5f5f5; color: #222; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .note { color: #666; font-size: 12px; }
+  code { background: #eef; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+  .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 12px 0; padding: 10px 12px; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .filters label { font-size: 13px; color: #444; }
+  .filters select, .filters input { font-size: 13px; padding: 4px 6px; border: 1px solid #d0d0d0; border-radius: 4px; }
+  .filters .spacer { flex: 1; }
+  .filters .summary { font-size: 12px; color: #888; }
+  .section { background: #fff; padding: 14px 16px; margin: 10px 0; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .chart { width: 100%; height: 400px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>AAPL 日行情快照</h1>
+<p class="note">数据源: <code>scraw_aapl_daily</code> · 静态快照 · ECharts (vendored, 离线可用)</p>
+
+<div class="filters">
+  <label>标的 <select id="entity-select"></select></label>
+  <label>起 <input type="date" id="start-date"></label>
+  <label>止 <input type="date" id="end-date"></label>
+  <span class="spacer"></span>
+  <span class="summary" id="filter-summary"></span>
+</div>
+
+<h2>AAPL 收盘价</h2>
+<div class="section"><div id="chart-a" class="chart"></div></div>
+
+<script id="dashboard-data" type="application/json">{"entities": ["aapl"], "dateField": "date", "series": {"aapl": [{"date": "2025-07-03", "close": 212.71}, {"date": "2025-07-07", "close": 209.12}, {"date": "2025-07-08", "close": 209.18}, {"date": "2025-07-09", "close": 210.31}, {"date": "2025-07-10", "close": 211.57}, {"date": "2025-07-11", "close": 210.33}, {"date": "2025-07-14", "close": 207.8}, {"date": "2025-07-15", "close": 208.28}, {"date": "2025-07-16", "close": 209.33}, {"date": "2025-07-17", "close": 209.19}, {"date": "2025-07-18", "close": 210.35}, {"date": "2025-07-21", "close": 211.64}, {"date": "2025-07-22", "close": 213.55}, {"date": "2025-07-23", "close": 213.3}, {"date": "2025-07-24", "close": 212.92}, {"date": "2025-07-25", "close": 213.03}, {"date": "2025-07-28", "close": 213.2}, {"date": "2025-07-29", "close": 210.44}, {"date": "2025-07-30", "close": 208.22}, {"date": "2025-07-31", "close": 206.75}, {"date": "2025-08-01", "close": 201.58}, {"date": "2025-08-04", "close": 202.55}, {"date": "2025-08-05", "close": 202.12}, {"date": "2025-08-06", "close": 212.41}, {"date": "2025-08-07", "close": 219.16}, {"date": "2025-08-08", "close": 228.44}, {"date": "2025-08-11", "close": 226.54}, {"date": "2025-08-12", "close": 229.0}, {"date": "2025-08-13", "close": 232.67}, {"date": "2025-08-14", "close": 232.12}, {"date": "2025-08-15", "close": 230.94}, {"date": "2025-08-18", "close": 230.24}, {"date": "2025-08-19", "close": 229.91}, {"date": "2025-08-20", "close": 225.37}, {"date": "2025-08-21", "close": 224.27}, {"date": "2025-08-22", "close": 227.12}, {"date": "2025-08-25", "close": 226.52}, {"date": "2025-08-26", "close": 228.66}, {"date": "2025-08-27", "close": 229.84}, {"date": "2025-08-28", "close": 231.9}, {"date": "2025-08-29", "close": 231.49}, {"date": "2025-09-02", "close": 229.07}, {"date": "2025-09-03", "close": 237.8}, {"date": "2025-09-04", "close": 239.1}, {"date": "2025-09-05", "close": 239.01}, {"date": "2025-09-08", "close": 237.21}, {"date": "2025-09-09", "close": 233.69}, {"date": "2025-09-10", "close": 226.15}, {"date": "2025-09-11", "close": 229.38}, {"date": "2025-09-12", "close": 233.41}, {"date": "2025-09-15", "close": 236.03}, {"date": "2025-09-16", "close": 237.48}, {"date": "2025-09-17", "close": 238.32}, {"date": "2025-09-18", "close": 237.21}, {"date": "2025-09-19", "close": 244.81}, {"date": "2025-09-22", "close": 255.36}, {"date": "2025-09-23", "close": 253.71}, {"date": "2025-09-24", "close": 251.6}, {"date": "2025-09-25", "close": 256.15}, {"date": "2025-09-26", "close": 254.74}, {"date": "2025-09-29", "close": 253.71}, {"date": "2025-09-30", "close": 253.91}, {"date": "2025-10-01", "close": 254.73}, {"date": "2025-10-02", "close": 256.4}, {"date": "2025-10-03", "close": 257.29}, {"date": "2025-10-06", "close": 255.97}, {"date": "2025-10-07", "close": 255.76}, {"date": "2025-10-08", "close": 257.33}, {"date": "2025-10-09", "close": 253.32}, {"date": "2025-10-10", "close": 244.58}, {"date": "2025-10-13", "close": 246.96}, {"date": "2025-10-14", "close": 247.07}, {"date": "2025-10-15", "close": 248.64}, {"date": "2025-10-16", "close": 246.75}, {"date": "2025-10-17", "close": 251.58}, {"date": "2025-10-20", "close": 261.5}, {"date": "2025-10-21", "close": 262.03}, {"date": "2025-10-22", "close": 257.72}, {"date": "2025-10-23", "close": 258.85}, {"date": "2025-10-24", "close": 262.08}, {"date": "2025-10-27", "close": 268.05}, {"date": "2025-10-28", "close": 268.24}, {"date": "2025-10-29", "close": 268.94}, {"date": "2025-10-30", "close": 270.63}, {"date": "2025-10-31", "close": 269.61}, {"date": "2025-11-03", "close": 268.29}, {"date": "2025-11-04", "close": 269.28}, {"date": "2025-11-05", "close": 269.38}, {"date": "2025-11-06", "close": 269.01}, {"date": "2025-11-07", "close": 267.71}, {"date": "2025-11-10", "close": 268.93}, {"date": "2025-11-11", "close": 274.74}, {"date": "2025-11-12", "close": 272.96}, {"date": "2025-11-13", "close": 272.44}, {"date": "2025-11-14", "close": 271.9}, {"date": "2025-11-17", "close": 266.96}, {"date": "2025-11-18", "close": 266.94}, {"date": "2025-11-19", "close": 268.06}, {"date": "2025-11-20", "close": 265.76}, {"date": "2025-11-21", "close": 270.99}, {"date": "2025-11-24", "close": 275.41}, {"date": "2025-11-25", "close": 276.46}, {"date": "2025-11-26", "close": 277.04}, {"date": "2025-11-28", "close": 278.33}, {"date": "2025-12-01", "close": 282.58}, {"date": "2025-12-02", "close": 285.66}, {"date": "2025-12-03", "close": 283.62}, {"date": "2025-12-04", "close": 280.18}, {"date": "2025-12-05", "close": 278.26}, {"date": "2025-12-08", "close": 277.37}, {"date": "2025-12-09", "close": 276.67}, {"date": "2025-12-10", "close": 278.26}, {"date": "2025-12-11", "close": 277.51}, {"date": "2025-12-12", "close": 277.76}, {"date": "2025-12-15", "close": 273.6}, {"date": "2025-12-16", "close": 274.1}, {"date": "2025-12-17", "close": 271.34}, {"date": "2025-12-18", "close": 271.69}, {"date": "2025-12-19", "close": 273.16}, {"date": "2025-12-22", "close": 270.47}, {"date": "2025-12-23", "close": 271.85}, {"date": "2025-12-24", "close": 273.3}, {"date": "2025-12-26", "close": 272.89}, {"date": "2025-12-29", "close": 273.25}, {"date": "2025-12-30", "close": 272.57}, {"date": "2025-12-31", "close": 271.36}, {"date": "2026-01-02", "close": 270.51}, {"date": "2026-01-05", "close": 266.76}, {"date": "2026-01-06", "close": 261.87}, {"date": "2026-01-07", "close": 259.85}, {"date": "2026-01-08", "close": 258.56}, {"date": "2026-01-09", "close": 258.89}, {"date": "2026-01-12", "close": 259.77}, {"date": "2026-01-13", "close": 260.57}, {"date": "2026-01-14", "close": 259.48}, {"date": "2026-01-15", "close": 257.73}, {"date": "2026-01-16", "close": 255.06}, {"date": "2026-01-20", "close": 246.24}, {"date": "2026-01-21", "close": 247.19}, {"date": "2026-01-22", "close": 247.89}, {"date": "2026-01-23", "close": 247.58}, {"date": "2026-01-26", "close": 254.94}, {"date": "2026-01-27", "close": 257.79}, {"date": "2026-01-28", "close": 255.96}, {"date": "2026-01-29", "close": 257.8}, {"date": "2026-01-30", "close": 259.0}, {"date": "2026-02-02", "close": 269.51}, {"date": "2026-02-03", "close": 268.98}, {"date": "2026-02-04", "close": 275.98}, {"date": "2026-02-05", "close": 275.4}, {"date": "2026-02-06", "close": 277.6}, {"date": "2026-02-09", "close": 274.37}, {"date": "2026-02-10", "close": 273.43}, {"date": "2026-02-11", "close": 275.25}, {"date": "2026-02-12", "close": 261.49}, {"date": "2026-02-13", "close": 255.54}, {"date": "2026-02-17", "close": 263.64}, {"date": "2026-02-18", "close": 264.11}, {"date": "2026-02-19", "close": 260.34}, {"date": "2026-02-20", "close": 264.34}, {"date": "2026-02-23", "close": 265.93}, {"date": "2026-02-24", "close": 271.89}, {"date": "2026-02-25", "close": 273.98}, {"date": "2026-02-26", "close": 272.7}, {"date": "2026-02-27", "close": 263.94}, {"date": "2026-03-02", "close": 264.48}, {"date": "2026-03-03", "close": 263.51}, {"date": "2026-03-04", "close": 262.28}, {"date": "2026-03-05", "close": 260.05}, {"date": "2026-03-06", "close": 257.22}, {"date": "2026-03-09", "close": 259.64}, {"date": "2026-03-10", "close": 260.59}, {"date": "2026-03-11", "close": 260.57}, {"date": "2026-03-12", "close": 255.52}, {"date": "2026-03-13", "close": 249.89}, {"date": "2026-03-16", "close": 252.59}, {"date": "2026-03-17", "close": 254.0}, {"date": "2026-03-18", "close": 249.71}, {"date": "2026-03-19", "close": 248.73}, {"date": "2026-03-20", "close": 247.76}, {"date": "2026-03-23", "close": 251.26}, {"date": "2026-03-24", "close": 251.41}, {"date": "2026-03-25", "close": 252.39}, {"date": "2026-03-26", "close": 252.66}, {"date": "2026-03-27", "close": 248.57}, {"date": "2026-03-30", "close": 246.4}, {"date": "2026-03-31", "close": 253.56}, {"date": "2026-04-01", "close": 255.39}, {"date": "2026-04-02", "close": 255.68}, {"date": "2026-04-06", "close": 258.62}, {"date": "2026-04-07", "close": 253.27}, {"date": "2026-04-08", "close": 258.66}, {"date": "2026-04-09", "close": 260.25}, {"date": "2026-04-10", "close": 260.24}, {"date": "2026-04-13", "close": 258.96}, {"date": "2026-04-14", "close": 258.59}, {"date": "2026-04-15", "close": 266.18}, {"date": "2026-04-16", "close": 263.16}, {"date": "2026-04-17", "close": 269.98}, {"date": "2026-04-20", "close": 272.8}, {"date": "2026-04-21", "close": 265.93}, {"date": "2026-04-22", "close": 272.92}, {"date": "2026-04-23", "close": 273.18}, {"date": "2026-04-24", "close": 270.81}, {"date": "2026-04-27", "close": 267.36}, {"date": "2026-04-28", "close": 270.46}, {"date": "2026-04-29", "close": 269.92}, {"date": "2026-04-30", "close": 271.1}, {"date": "2026-05-01", "close": 279.88}, {"date": "2026-05-04", "close": 276.58}, {"date": "2026-05-05", "close": 283.92}, {"date": "2026-05-06", "close": 287.25}, {"date": "2026-05-07", "close": 287.18}, {"date": "2026-05-08", "close": 293.05}, {"date": "2026-05-11", "close": 292.68}, {"date": "2026-05-12", "close": 294.8}, {"date": "2026-05-13", "close": 298.87}, {"date": "2026-05-14", "close": 298.21}, {"date": "2026-05-15", "close": 300.23}, {"date": "2026-05-18", "close": 297.84}, {"date": "2026-05-19", "close": 298.97}, {"date": "2026-05-20", "close": 302.25}, {"date": "2026-05-21", "close": 304.99}, {"date": "2026-05-22", "close": 308.82}, {"date": "2026-05-26", "close": 308.33}, {"date": "2026-05-27", "close": 310.85}, {"date": "2026-05-28", "close": 312.51}, {"date": "2026-05-29", "close": 312.06}, {"date": "2026-06-01", "close": 306.31}, {"date": "2026-06-02", "close": 315.2}, {"date": "2026-06-03", "close": 310.26}, {"date": "2026-06-04", "close": 311.23}, {"date": "2026-06-05", "close": 307.34}, {"date": "2026-06-08", "close": 301.54}, {"date": "2026-06-09", "close": 290.55}, {"date": "2026-06-10", "close": 291.58}, {"date": "2026-06-11", "close": 295.63}, {"date": "2026-06-12", "close": 291.13}, {"date": "2026-06-15", "close": 296.42}, {"date": "2026-06-16", "close": 299.24}, {"date": "2026-06-17", "close": 295.95}, {"date": "2026-06-18", "close": 298.01}, {"date": "2026-06-22", "close": 297.01}, {"date": "2026-06-23", "close": 294.3}, {"date": "2026-06-24", "close": 293.08}, {"date": "2026-06-25", "close": 275.15}, {"date": "2026-06-26", "close": 283.78}, {"date": "2026-06-29", "close": 281.74}, {"date": "2026-06-30", "close": 289.36}, {"date": "2026-07-01", "close": 294.38}, {"date": "2026-07-02", "close": 308.63}]}}</script>
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById("dashboard-data").textContent);
+  const entitySelect = document.getElementById("entity-select");
+  DATA.entities.forEach(e => { const o = document.createElement("option"); o.value = e; o.textContent = e; entitySelect.appendChild(o); });
+  const allDates = DATA.series[DATA.entities[0]].map(r => r.date).sort();
+  const startInput = document.getElementById("start-date");
+  const endInput = document.getElementById("end-date");
+  startInput.value = allDates[0]; endInput.value = allDates[allDates.length - 1];
+  const chartA = echarts.init(document.getElementById("chart-a"));
+  function getFiltered() {
+    const e = entitySelect.value; const s = startInput.value; const en = endInput.value;
+    let rows = (DATA.series[e] || []).slice();
+    if (s) rows = rows.filter(r => r.date >= s);
+    if (en) rows = rows.filter(r => r.date <= en);
+    return rows;
+  }
+  function render() {
+    const rows = getFiltered();
+    chartA.setOption({
+      tooltip: { trigger: "axis" },
+      grid: { left: 50, right: 20, top: 30, bottom: 30 },
+      xAxis: { type: "category", data: rows.map(r => r.date) },
+      yAxis: { type: "value", scale: true },
+      series: [{ name: "Close", type: "line", data: rows.map(r => r.close), smooth: true, lineStyle: { width: 2 }, areaStyle: { opacity: 0.08 } }],
+    }, true);
+    document.getElementById("filter-summary").textContent = `${entitySelect.value} · ${rows.length} 行 · ${rows.length ? rows[0].date + " ~ " + rows[rows.length-1].date : "无数据"}`;
+  }
+  entitySelect.addEventListener("change", render);
+  startInput.addEventListener("change", render);
+  endInput.addEventListener("change", render);
+  window.addEventListener("resize", () => chartA.resize());
+  render();
+})();
+</script>
+</body>
+</html>

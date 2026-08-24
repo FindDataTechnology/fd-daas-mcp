@@ -1,0 +1,72 @@
+[project]
+name = "fd-daas-mcp"
+version = "0.1.0"
+description = "Consolidated DAAS MCP server + CLI - hosts alerts/cron/composite/daas/dashboard/gateway/workflow tools behind one stdio server and one Click CLI"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "FindDataOfficial" }]
+dependencies = [
+    "fastmcp>=3.4.2",
+    "click>=8.0",
+    "pandas>=1.0",
+    "sqlalchemy>=2.0",
+    "python-dotenv>=1.0",
+    "apscheduler>=3.11.2",
+    "mcp-models",
+    # fd-open-data-mcp is the sole data-fetch upstream surfaced through the
+    # gateway group (replaces the 11 per-source data-fetch MCPs). It carries
+    # its own concept/ranking/cache layer + its own SQLite store; DAAS only
+    # calls it as a client via call_data_mcp. Path-sourced from the sibling
+    # ~/finddata repo (editable). Its transitive dep fd-open-data-protocol
+    # resolves via fd-open-data-mcp's own [tool.uv.sources].
+    "fd-open-data-mcp",
+]
+
+[project.optional-dependencies]
+# akshare is imported lazily by daas source modules; install for live A-share fetches.
+akshare = ["akshare>=1.13"]
+# elasticsearch powers cnreport ES store/search tools.
+es = ["elasticsearch>=8.0"]
+# Dropped optional groups (lost with the prior fd-daas-mcp); their extras are
+# removed to avoid advertising unmaintained deps. Restore from the archived
+# openspec specs listed in daas/fd_daas_mcp/registry.py:
+#   scrapling, firecrawl -> archive/2026-07-12-fold-scrapling-add-firecrawl
+#   massive              -> archive/2026-07-06-add-massive-datasources
+# (pdf was restored as a local vector-search group - see the `pdf` extra below
+# and openspec/changes/add-pdf-vector-search; no longer "dropped".)
+# Local PDF/text vector search: sentence-transformers (embeddings) + sqlite-vec
+# (vec0 ANN index) + pdfplumber/pypdf (text extraction). Loaded as an optional
+# `pdf` tool group gated on `sqlite_vec` (see registry.py). No API key, no egress.
+pdf = ["sentence-transformers", "sqlite-vec", "pdfplumber", "pypdf"]
+# Position rules: CSS/xpath (lxml+cssselect) + json-path (jsonpath-ng) extraction.
+# regex needs no extra dep. Lazy-imported by rule_engine._eval_position, so a
+# missing install degrades to a per-rule error, never a server-startup crash.
+position = ["lxml", "cssselect", "jsonpath-ng"]
+# REPL history/autocomplete.
+repl = ["prompt_toolkit>=3.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+fd-daas-mcp = "daas.fd_daas_mcp.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["daas.*"]
+
+[tool.uv.sources]
+mcp-models = { path = "models", editable = true }
+# fd-open-data-mcp lives in the sibling ~/finddata repo (machine-local path,
+# matches the ~/finddata layout documented in CLAUDE.md). uv resolves its
+# transitive fd-open-data-protocol dep via fd-open-data-mcp's own sources.
+fd-open-data-mcp = { path = "/Users/chengsishi/finddata/fd-open-data-mcp", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# The .venv leaks micromamba site-packages whose logfire pytest plugin crashes
+# on import (opentelemetry._tail_sampling). `-p no:X` is a no-op when the plugin
+# isn't registered, so this is safe in a clean venv too.
+addopts = "-p no:logfire -p no:pytest_logfire"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

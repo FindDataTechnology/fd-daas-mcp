@@ -1,0 +1,33 @@
+name: build-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: twine check
+        run: twine check dist/*
+      - name: Wheel smoke test
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/python -m pip install --upgrade pip
+          /tmp/venv/bin/python -m pip install dist/*.whl
+          /tmp/venv/bin/python -c "from daas.fd_daas_mcp.server import app; print('server OK')"
+      - name: Docker build check
+        run: |
+          docker build -f Dockerfile -t fd-daas-mcp:test .

@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+# fd-daas-mcp server launcher - portable, self-locating.
+#
+# Resolves its own directory, sets PYTHONPATH so the `daas` package
+# imports, and execs the consolidated server module with the project .venv
+# python (falling back to `python3` on PATH if the .venv is absent).
+#
+# Claude Code ignores `.mcp.json`'s `cwd` field, so the launch must be
+# self-locating. This script is the `command` entry in repo-root `.mcp.json`,
+# which keeps the launch logic version-controlled rather than hardcoded to a
+# user-global interpreter.
+set -e
+
+# Resolve this script's dir (bin/) and the fd-daas-mcp home (its parent).
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+FD_HOME=$(dirname -- "$SCRIPT_DIR")
+
+# Prefer the project .venv (reproducible); fall back to PATH python3.
+if [ -x "$FD_HOME/.venv/bin/python" ]; then
+    PY="$FD_HOME/.venv/bin/python"
+else
+    PY="python3"
+fi
+
+# `daas` lives at $FD_HOME/; put it on PYTHONPATH for `-m` discovery.
+export PYTHONPATH="$FD_HOME${PYTHONPATH:+:$PYTHONPATH}"
+
+exec "$PY" -m daas.fd_daas_mcp.server "$@"

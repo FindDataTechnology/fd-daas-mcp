@@ -1,0 +1,22 @@
+[project]
+name = "composite-mcp"
+version = "0.1.0"
+description = "Composite MCP — curate selected tools from multiple upstream MCPs + chained tools"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "sqlalchemy>=2.0",
+    "python-dotenv>=1.0",
+    "mcp-models",
+]
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "composite_database",
+    "composite_tools",
+    "ui_tools",
+]
+
+[tool.uv.sources]
+mcp-models = { path = "../models", editable = true }

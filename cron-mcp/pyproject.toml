@@ -1,0 +1,32 @@
+[project]
+name = "cron-mcp"
+version = "0.1.0"
+description = "Agent Scheduler MCP Server — AI-agent-driven cron scheduling with SQLite + APScheduler"
+requires-python = ">=3.11"
+dependencies = [
+    "apscheduler>=3.11.2",
+    "fastmcp>=3.4.2",
+    "mcp>=1.28.0",
+    "sqlalchemy>=2.0.51",
+    "mcp-models",
+]
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "registry",
+    "database",
+    "agent_runner",
+    "scheduler",
+    "main",
+    "tasks",
+]
+
+[project.scripts]
+cron-mcp = "server:main_entry"
+
+[tool.setuptools.package-data]
+"*" = ["*.py"]
+
+[tool.uv.sources]
+mcp-models = { path = "../models", editable = true }

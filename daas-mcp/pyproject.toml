@@ -1,0 +1,42 @@
+[project]
+name = "daas-mcp"
+version = "0.1.0"
+description = "MCP server for DAAS multi-source data access, LLM extraction, and math indicators"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "sqlalchemy>=2.0",
+    "pandas>=1.0",
+    "pyyaml>=6.0",
+    # process tools (relocated from process-mcp): LLM extraction path
+    "httpx>=0.27",
+    "jsonschema>=4.0",
+    "pypdf>=4.0",
+    "python-dotenv>=1.0",
+    # shared schema package (Base + ORM for all MCP domains)
+    "mcp-models",
+]
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "daas_tools",
+    "daas_database",
+    "entity_tools",
+    "entity_sync",
+    "registry_service",
+    "pipeline_tools",
+    # process tools (relocated from process-mcp)
+    "process_api",
+    "process_tools",
+    "process_database",
+    "indicator_tools",
+    "migrate_process_cron",
+]
+
+[tool.uv.sources]
+mcp-models = { path = "../models", editable = true }
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
