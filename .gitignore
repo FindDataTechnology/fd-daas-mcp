@@ -19,6 +19,12 @@ env/
 .env
 .env.local
 
+# Local databases / runtime artifacts
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
 # IDE
 .vscode/
 .idea/
