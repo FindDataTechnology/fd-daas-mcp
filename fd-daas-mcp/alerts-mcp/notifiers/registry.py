@@ -7,24 +7,12 @@ outcomes in `alert_events.channels_results_json`.
 from __future__ import annotations
 
 from .base import Notifier
-from .discord import DiscordNotifier
-from .dingtalk import DingTalkNotifier
 from .feishu import FeishuNotifier
-from .slack import SlackNotifier
-from .telegram import TelegramNotifier
-from .twitter import TwitterNotifier
-from .wecowork import WeComNotifier
 
 
 def _build_registry() -> dict[str, Notifier]:
     adapters: list[Notifier] = [
-        TelegramNotifier(),
-        DiscordNotifier(),
-        SlackNotifier(),
-        TwitterNotifier(),
-        DingTalkNotifier(),
         FeishuNotifier(),
-        WeComNotifier(),
     ]
     return {a.name: a for a in adapters}
 

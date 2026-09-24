@@ -13,7 +13,6 @@ made and no real messages are sent. Verifies:
   - dispatch fan-out with one failing channel (fault isolation)
   - alert_events row insertion + rule-state update
   - list_channels secret-redaction (no credential leakage)
-  - Twitter OAuth 1.0a signing vs an oauthlib-verified vector
   - CLI --run-rule / --run-all exit without starting stdio
 
 Passes with no ALERTS_* env vars set.
@@ -45,7 +44,6 @@ import expressions as E  # noqa: E402
 import engine  # noqa: E402
 import server  # noqa: E402
 from notifiers import list_channels  # noqa: E402
-from notifiers.twitter import sign as twitter_sign  # noqa: E402
 
 # Clear any ALERTS_* leaked from root .env so the "no env" baseline holds.
 for _k in list(os.environ):
@@ -76,13 +74,12 @@ engine._channel_send = _stub_send
 
 db = adb.get_db()
 
-# ── 1. list_channels: 7 channels, all unconfigured with no env ───
+# ── 1. list_channels: 1 channel, unconfigured with no env ────────
 ch = list_channels()
-check("list_channels returns 7 channels", len(ch) == 7, str([c["name"] for c in ch]))
+check("list_channels returns 1 channel", len(ch) == 1, str([c["name"] for c in ch]))
 check(
     "list_channels names correct",
-    {c["name"] for c in ch}
-    == {"telegram", "discord", "slack", "twitter", "dingtalk", "feishu", "wecowork"},
+    {c["name"] for c in ch} == {"feishu"},
 )
 check("all channels unconfigured with no env", all(not c["configured"] for c in ch), str(ch))
 
@@ -114,30 +111,7 @@ for bad in [
     except E.ExpressionError:
         check(f"blocked malicious: {bad[:30]}", True)
 
-# ── 4. Twitter OAuth 1.0a signing vs oauthlib-verified vector ────
-# Vector verified against oauthlib's Client (see design D5). Inputs:
-#   POST https://api.twitter.com/1.1/statuses/update.json
-#   body param status="Hello World" + oauth_* (incl oauth_version=1.0)
-#   consumer_secret="cs", token_secret="ts"
-tw_params = [
-    ("status", "Hello World"),
-    ("oauth_consumer_key", "ck"),
-    ("oauth_nonce", "abc123"),
-    ("oauth_signature_method", "HMAC-SHA1"),
-    ("oauth_timestamp", "1700000000"),
-    ("oauth_token", "tk"),
-    ("oauth_version", "1.0"),
-]
-tw_sig = twitter_sign(
-    "POST", "https://api.twitter.com/1.1/statuses/update.json", tw_params, "cs", "ts"
-)
-check(
-    "twitter OAuth signature matches oracle vector",
-    tw_sig == "h/NEWvkp64JcbpY21mqKU9KBmvU=",
-    f"got {tw_sig}",
-)
-
-# ── 5. build a scraw fixture + rule CRUD ─────────────────────────
+# ── 4. build a scraw fixture + rule CRUD ─────────────────────────
 with db.engine.begin() as conn:
     conn.execute(adb.text(
         "CREATE TABLE scraw_alerts_test (id INTEGER PRIMARY KEY, date TEXT, value REAL)"
@@ -250,16 +224,14 @@ check("delete_rule onchange ok", ok is True)
 check("delete_rule cascaded events", len(db.list_events("onchange")) == 0)
 
 # ── 9. list_channels secret-redaction ───────────────────────────
-os.environ["ALERTS_TELEGRAM_BOT_TOKEN"] = "leak-canary-token-xyz"
-os.environ["ALERTS_TELEGRAM_CHAT_ID"] = "111"
+os.environ["ALERTS_FEISHU_WEBHOOK_URL"] = "https://open.feishu.cn/hook/leak-canary-hook-xyz"
 ch2 = list_channels()
 blob = json.dumps(ch2)
-tg = next((c for c in ch2 if c["name"] == "telegram"), {})
-check("telegram configured after setting token", tg.get("configured") is True, str(tg))
-check("list_channels does NOT leak secret", "leak-canary-token-xyz" not in blob, blob[:200])
+fs = next((c for c in ch2 if c["name"] == "feishu"), {})
+check("feishu configured after setting webhook", fs.get("configured") is True, str(fs))
+check("list_channels does NOT leak secret", "leak-canary-hook-xyz" not in blob, blob[:200])
 check("list_channels does not return raw values", all("value" not in c for c in ch2), str(ch2))
-del os.environ["ALERTS_TELEGRAM_BOT_TOKEN"]
-del os.environ["ALERTS_TELEGRAM_CHAT_ID"]
+del os.environ["ALERTS_FEISHU_WEBHOOK_URL"]
 
 # ── 10. CLI branches exit without stdio ──────────────────────────
 cli = subprocess.run(

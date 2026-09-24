@@ -1,9 +1,8 @@
 """Notifier plugin layer for alerts-mcp.
 
-A `Notifier` is an outbound channel adapter (Telegram, Discord, Slack, Twitter,
-DingTalk, Feishu, 企业微信). Each adapter reads its credentials from root `.env`
-under `ALERTS_*` prefixes, reports `is_configured()`, and implements
-`send(message, ctx) -> {"ok": bool, "error": str?}`.
+A `Notifier` is an outbound channel adapter (Feishu). Each adapter reads its
+credentials from root `.env` under `ALERTS_*` prefixes, reports
+`is_configured()`, and implements `send(message, ctx) -> {"ok": bool, "error": str?}`.
 
 `registry.send(channel, message, ctx)` looks up the adapter by name and never
 raises — missing/unconfigured channels return `{"ok": False, "error": ...}` so
