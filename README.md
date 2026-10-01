@@ -1,6 +1,8 @@
 # DAAS - Data As a Service
 
-> 📖 **Quick Start**: [QUICKSTART.md](QUICKSTART.md) (curl → install → ask your AI) · 中文文档: [README_zh.md](README_zh.md)
+> **Facet (谦面) product line** · the local self-hosted data platform line of [FindData](https://www.finddatatech.cloud/products/facet) — one SQLite file behind a consolidated MCP server.
+
+> 📖 **Quick Start**: [QUICKSTART.md](QUICKSTART.md) (curl → install → ask your AI) · 中文文档: [README.zh-CN.md](README.zh-CN.md)
 
 Layered data platform for financial, economic, and statistical data — a single SQLite file (`daas.db`) behind a consolidated MCP server, with data fetch delegated down to the `fd-open-data-mcp` upstream.
 

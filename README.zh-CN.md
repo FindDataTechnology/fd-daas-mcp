@@ -1,5 +1,7 @@
 # DAAS - Data as a Service（数据即服务）
 
+> **谦面 Facet 产品线** · [寻数 FindData](https://www.finddatatech.cloud/products/facet) 的本地自托管数据平台线 —— 单 SQLite 文件 + 合并 MCP 服务器。
+
 > 📖 **快速开始**：[QUICKSTART.md](QUICKSTART.md)（curl 一键安装 → 用 AI 驱动）· English: [README.md](README.md)
 
 分层式金融/经济/统计数据平台 —— 一个 SQLite 文件（`daas.db`）撑起一个聚合 MCP 服务，数据抓取下沉到 `fd-open-data-mcp` 上游。
