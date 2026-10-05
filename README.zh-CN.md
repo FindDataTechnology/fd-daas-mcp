@@ -16,7 +16,7 @@
 curl -fsSL https://raw.githubusercontent.com/FindDataTechnology/fd-daas-mcp/master/install.sh | sh
 ```
 
-这一条命令会克隆 DAAS + `fd-open-data-mcp` 上游、配好两个 venv、初始化 `daas.db`、把 `.mcp.json` 改写成你的本地路径。当它打印 `done: ~/code/DAAS` 时，**161 个 MCP 工具** 和 **18 个 Claude Code 技能** 已部署并接好 —— 无需再做任何设置。
+这一条命令会克隆 DAAS + `fd-open-data-mcp` 上游、配好两个 venv、初始化 `daas.db`、把 `.mcp.json` 改写成你的本地路径。当它打印 `done: ~/code/DAAS` 时，**160+ 个 MCP 工具** 和 **13 个产品级 Claude Code 技能** 已部署并接好 —— 无需再做任何设置。（工具数以运行时为准 —— `selfcheck` 是权威口径，最近一次实测 161；`.claude/skills/` 共 32 个目录，其中 13 个是产品技能。）
 
 然后在 AI agent 里打开这个目录，用自然语言问：
 
@@ -32,13 +32,13 @@ claude
 - *"RSI 上穿 70 时提醒我"*
 - *"每天晚上定时跑这个抓取"*
 
-agent 两套接口都已就绪 —— **161 个 MCP 工具**横跨 9 个组（`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`）会从 `.mcp.json` 自动加载，`.claude/skills/` 下的 **18 个技能**是 agent 在任务匹配时自动调用的薄手册（`fd-daas-based-data-fetch` 负责 解析→抓取→落库，`fd-daas-research` 编排一整项研究，等等）。
+agent 两套接口都已就绪 —— **160+ 个 MCP 工具**横跨 9 个组（`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`）会从 `.mcp.json` 自动加载（运行时以 `selfcheck` 为准），`.claude/skills/` 下的 **13 个产品技能**是 agent 在任务匹配时自动调用的薄手册（`fd-daas-based-data-fetch` 负责 解析→抓取→落库，`fd-daas-research` 编排一整项研究，等等）。
 
 验证安装是否健康（或者直接让 agent 跑）：
 
 ```bash
 fd-daas-mcp/.venv/bin/fd-daas-mcp doctor            # 路径 + schema + 行数
-fd-daas-mcp/.venv/bin/python -m daas.fd_daas_mcp.selfcheck   # 161 个工具，failed=0
+fd-daas-mcp/.venv/bin/python -m daas.fd_daas_mcp.selfcheck   # 工具数（运行时为准；最近一次：161），failed=0
 ```
 
 一次真实的抓取（你让 agent 抓数据时，它跑的就是这个）：
@@ -48,11 +48,11 @@ uv run python .claude/skills/fd-daas-based-data-fetch/scripts/run_indicator.py S
 sqlite3 daas.db "SELECT source, COUNT(*) FROM observations GROUP BY source"
 ```
 
-> 上面的快速开始命令均已在本仓库验证：`SPY_ma5` 是一条真实的 `indicator_rules` 记录，`fd-daas-mcp` 注册表报告 **9 个来源共 161 个工具**（`failed=0, skipped_optional=1`，即可选的 `pdf` 组）。
+> 上面的快速开始命令均已在本仓库验证：`SPY_ma5` 是一条真实的 `indicator_rules` 记录，`fd-daas-mcp` 注册表报告 **9 个组全部健康**（`failed=0, skipped_optional=1`，即可选的 `pdf` 组；最近一次实测 161 个工具 —— 运行时口径为准）。
 
 环境要求：Python 3.10+ 和 `uv`（脚本会自动安装 `uv`）。环境变量覆盖：`DAAS_DEST`（默认 `~/code/DAAS`）、`DAAS_BRANCH`（默认 `master`）、`FINDDATA_HOME`（默认 `~/finddata`）。`dartlab` 抓取需要 3.12：`uv run --python 3.12 --with dartlab ...`。可选凭据（`HTTP_PROXY`、`EDGAR_IDENTITY`、`EDINET_API_KEY`、`LLM_*`、`ALERTS_FEISHU_WEBHOOK_URL`）放在仓库根目录的 `.env` 里 —— 见 [环境变量](#环境变量)。
 
-> **非 Claude Code 的 MCP 客户端？** 这 161 个工具在任何支持 MCP 的客户端（Cursor、Cline……）都能用。技能只是 Claude Code 的便利层 —— 可选，不是驱动服务的必需项。
+> **非 Claude Code 的 MCP 客户端？** 这 160+ 个工具在任何支持 MCP 的客户端（Cursor、Cline……）都能用。技能只是 Claude Code 的便利层 —— 可选，不是驱动服务的必需项。
 
 <details>
 <summary>手动安装（跳过 curl 脚本）</summary>
@@ -99,7 +99,7 @@ L0  fd-open-data-mcp  (唯一数据抓取上游；基于概念的语义抓取器
 ```
 
 - **L0 — fd-open-data-mcp**（兄弟仓库）：唯一数据抓取面。基于概念的语义抓取器，带排序/故障转移/缓存；持有 entity 主数据（`entities`、`entity_datasource_links`）。以 HTTP `:8300` 服务（stdio 回退）。取代了原先 11 个按数据源拆分的数据抓取 MCP。
-- **L1 — fd-daas-mcp**（本仓库）：聚合 stdio 服务，仓库根 [`.mcp.json`](.mcp.json) 的唯一入口。在**一个服务 + 一个 `fd-daas-mcp` Click CLI**背后暴露 **9 个组共 161 个工具**（`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`）。薄聚合层在 `fd-daas-mcp/daas/fd_daas_mcp/`（`server.py`/`registry.py`/`cli.py`/`selfcheck.py`）；每个组的工具代码在包内 `fd-daas-mcp/<group>-mcp/`。
+- **L1 — fd-daas-mcp**（本仓库）：聚合 stdio 服务，仓库根 [`.mcp.json`](.mcp.json) 的唯一入口。在**一个服务 + 一个 `fd-daas-mcp` Click CLI**背后暴露 **9 个组共 160+ 个工具**（运行时以 `selfcheck` 为准）（`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`）。薄聚合层在 `fd-daas-mcp/daas/fd_daas_mcp/`（`server.py`/`registry.py`/`cli.py`/`selfcheck.py`）；每个组的工具代码在包内 `fd-daas-mcp/<group>-mcp/`。
 - **L2 — workflow manifest**：manifest 存在 `daas.db` 的 `workflows` 表（用 `workflow_register` 注册，用 `workflow_run` 运行）。`build_workflow_from_goal` 用 LLM 把自然语言目标分解成 manifest。
 - **L3 — 用户 MCP 组合**：一个 composite manifest（`{name, upstreams, tools, workflows, prompt}`）策展出一个命名的 MCP 接口面，在聚合服务进程内服务。CRUD 走 `composite_*_manifest`。
 
@@ -114,7 +114,7 @@ L0  fd-open-data-mcp  (唯一数据抓取上游；基于概念的语义抓取器
 ```
 daas/
 ├── .claude/skills/          # Claude Code 技能（fd-daas-based-data-fetch 是核心抓取壳）
-├── fd-daas-mcp/             # 聚合 MCP 服务 —— .mcp.json 唯一入口（161 个工具，9 个组）
+├── fd-daas-mcp/             # 聚合 MCP 服务 —— .mcp.json 唯一入口（160+ 个工具，9 个组）
 │   ├── alerts-mcp/          #   告警规则引擎 + 7 个通知渠道
 │   ├── composite-mcp/       #   用户 MCP 组合（策展工具 + 内嵌 workflow + prompt）
 │   ├── cron-mcp/            #   任务 + 计划注册表（DB 持久化）
@@ -152,7 +152,7 @@ daas/
 
 ## 技能（`.claude/skills/`）
 
-技能是纯 Markdown（`SKILL.md`）+ Python 脚本 —— agent 在任务匹配时自动调用的薄手册。抓取技能收集参数后调用 `workflow_run`；它们不再直接调 Python 数据库（抓取走 L1→L0）。**仓库随附 18 个技能：**
+技能是纯 Markdown（`SKILL.md`）+ Python 脚本 —— agent 在任务匹配时自动调用的薄手册。抓取技能收集参数后调用 `workflow_run`；它们不再直接调 Python 数据库（抓取走 L1→L0）。**仓库随附 13 个产品技能**（8 个数据消费 + 5 个创作；`.claude/skills/` 共 32 个目录 —— 其余 19 个是 5 个 `openspec-*` 工作流技能 + 14 个本地开发工具，属于仓库工具而非产品面）：
 
 | 技能 | 用途 |
 |---|---|
@@ -174,7 +174,7 @@ daas/
 
 ## MCP 工具组（`fd-daas-mcp`）
 
-聚合服务暴露 **9 个组共 161 个工具**（`failed=0, skipped_optional=1`，即可选的 `pdf` 组）。目录是组级粒度（每个工具的细节走服务自身的内省 / `selfcheck`）。
+聚合服务暴露 **9 个组共 160+ 个工具** —— 运行时以 `selfcheck` 为准（最近一次实测：161 个工具，`failed=0`，`skipped_optional=1` 为可选的 `pdf` 组；下表各组分计数对应该次实测）。目录是组级粒度（每个工具的细节走服务自身的内省 / `selfcheck`）。
 
 | 组 | 前缀 | 工具数 | 用途 |
 |---|---|---|---|
@@ -218,7 +218,7 @@ daas/
 
 - **抓数据走 workflow 路径。** 用 `fd-daas-based-data-fetch`：通过 `sqlite3` 对 `daas.db` 解析 entity + 指标，然后 `workflow_run(name, params)` —— manifest 把抓取下沉到 `gateway_call` → `fd-open-data-mcp`（L0）并落库到 `scraw_<slug>` / `observations`。多步抓取用 `build_workflow_from_goal` 生成 manifest。
 - **工作流：** 解析 → 抓取（经 L0）→ 落库。在 `daas.db` 解析 entity+指标；经网关抓取；落进 `scraw_<slug>`（原始）或 `observations`（算好的指标）。
-- **其他一切用 MCP 服务** —— 浏览目录、创建指标/集合/规则、cron 排程、告警、构建/查找看板、PDF 语义搜索、composite 编排、研究 bundle。这些是 `fd-daas-mcp` 的工具（9 个组共 161 个）。
+- **其他一切用 MCP 服务** —— 浏览目录、创建指标/集合/规则、cron 排程、告警、构建/查找看板、PDF 语义搜索、composite 编排、研究 bundle。这些是 `fd-daas-mcp` 的工具（9 个组共 160+ 个，运行时以 `selfcheck` 为准）。
 - **从仓库根用 `sqlite3` 查 `daas.db`**（`sqlite3 daas.db "…"`）。FK 级联用 `PRAGMA foreign_keys=ON`。
 - **权威架构 + schema 参考：** [`CLAUDE.md`](CLAUDE.md)（有 `## daas.db` 列出所有表）和 [`construction/mcp.md`](construction/mcp.md)（L0/L1/L2/L3 分层参考）。
 

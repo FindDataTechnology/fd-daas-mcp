@@ -1,6 +1,6 @@
 [project]
 name = "daas"
-version = "0.1.0"
+version = "0.2.0"
 description = "DAAS - Data As a Service: layered MCP stack. fd-open-data-mcp (sibling repo) owns data-fetch adapters + the entity master; fd-daas-mcp owns daas/cron/alerts/dashboard/composite/research/pdf/gateway/workflow. Fetch goes through workflow manifests, not direct library imports."
 requires-python = ">=3.10"
 dependencies = [

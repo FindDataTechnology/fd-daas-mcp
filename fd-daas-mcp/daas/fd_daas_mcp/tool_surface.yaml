@@ -1,0 +1,199 @@
+# Tool-surface manifest for fd-daas-mcp (facet-mcp-foundation-v1 task 2.1).
+#
+# Contract (openspec/changes/facet-mcp-foundation-v1/specs/mcp-surface-contract):
+# every tool group / tool carries an exposure level:
+#   commercial -> may enter the commercial supply surface (packs, business-mcp
+#                 exposure). Read-only catalog / caliber / reference / query
+#                 tools that never write local state.
+#   internal   -> local / internal only. Everything that creates, writes,
+#                 deletes, executes, schedules, or ingests.
+# Grading discipline (宁可偏严): when in doubt, grade internal.
+#
+# selfcheck (daas/fd_daas_mcp/selfcheck.py) asserts both directions:
+#   coverage -> every registry group/tool is graded here; a tool may only be
+#               commercial via an EXPLICIT entry, so a group-level `commercial`
+#               posture must enumerate all its tools (a newly added tool can
+#               never silently become commercial - it fails the selfcheck as
+#               unclassified instead). Group-level `internal` may stay implicit:
+#               new tools of an internal-default group are internal by default.
+#   ghosts   -> every explicit manifest entry must exist in the registry
+#               (optional groups skipped this run are excused).
+#
+# Business anchors that MUST stay commercial (business-mcp daas domain exposes
+# exactly these 8): daas_list_indicators, daas_get_indicator,
+# daas_search_entities, daas_get_entity, daas_list_rules, daas_list_sources,
+# daas_search_functions, daas_get_function_detail.
+#
+# The pdf group is optional (loads only when its `sqlite_vec` dep imports - see
+# registry.py); it is graded at group level and is excused from the ghost check
+# when skipped.
+manifest_version: 1
+server: fd-daas-mcp
+updated: '2026-10-06'
+
+# Product skills allowed into packs (facet-mcp-foundation-v1 task 3.2).
+skills:
+  consume:
+    - fd-daas-based-data-fetch
+    - fd-daas-fetch-data
+    - fd-datasource-akshare
+    - fd-daas-research
+    - fd-daas-brainstorm
+    - fd-daas-dashboard
+    - fd-daas-pdf
+    - fd-daas-entities-collection
+  create:
+    - fd-daas-entities-collection-creator
+    - fd-daas-indicators-creator
+    - fd-daas-indicators-collection-creator
+    - fd-daas-rules-creator
+    - fd-daas-dashboard-creator
+
+# Supported host forms (daas-hosted-surface spec).
+hosts:
+  - shared-readonly-catalog
+  - per-deployment-workspace
+  - local-stdio
+
+groups:
+  # Observability over the alerting subsystem; rule CRUD + dispatch. Internal.
+  alerts:
+    level: internal
+
+  # Scheduler: task/schedule CRUD + execution. Internal.
+  cron:
+    level: internal
+
+  # Composite assembly/management (upstreams, proxied/chained tools, manifests).
+  # Internal.
+  composite:
+    level: internal
+
+  # The catalog/caliber group: sources, functions, entities, indicators, rules.
+  # Posture is commercial, but every tool is graded explicitly - only the
+  # read-only directory/reference queries are commercial; all workspace
+  # mutation (collections, pipelines, links) and all execution (fetch_data,
+  # run/test/calculate, extract_*) stay internal.
+  daas:
+    level: commercial
+    tools:
+      # --- catalog / caliber / reference reads (commercial) ---
+      list_sources: commercial
+      search_functions: commercial
+      get_function_detail: commercial
+      list_categories: commercial
+      search_datasources: commercial
+      get_category_tree: commercial
+      list_forms: commercial
+      search_entities: commercial
+      get_entity: commercial
+      list_entities: commercial
+      get_entity_coverage: commercial
+      list_rules: commercial
+      get_rule: commercial
+      list_indicators: commercial
+      get_indicator: commercial
+      list_indicator_ops: commercial
+      list_models: commercial
+      list_source_tables: commercial
+      # --- execution (fetch / run / test / calculate / extract) ---
+      fetch_data: internal
+      run_rule: internal
+      test_rule: internal
+      extract_text: internal
+      extract_image: internal
+      extract_file: internal
+      run_indicator: internal
+      calculate_indicator: internal
+      # --- datasource / category / form mutation ---
+      create_datasource: internal
+      update_datasource: internal
+      delete_datasource: internal
+      create_category: internal
+      move_category: internal
+      delete_category: internal
+      add_form: internal
+      add_section: internal
+      # --- datasource collections (workspace state) ---
+      create_collection: internal
+      add_to_collection: internal
+      remove_from_collection: internal
+      list_collections: internal
+      list_collection_items: internal
+      rename_collection: internal
+      update_collection: internal
+      delete_collection: internal
+      reorder_collection_items: internal
+      set_collection_item_score: internal
+      # --- entity-datasource links ---
+      link_entity_datasource: internal
+      unlink_entity_datasource: internal
+      # --- entity collections (workspace state) ---
+      create_entity_collection: internal
+      list_entity_collections: internal
+      get_entity_collection: internal
+      update_entity_collection: internal
+      delete_entity_collection: internal
+      add_entity_to_collection: internal
+      remove_entity_from_collection: internal
+      list_entity_collection_items: internal
+      reorder_entity_collection_items: internal
+      list_entity_collection_changes: internal
+      sync_entity_collection: internal
+      # --- indicator collections (workspace state) ---
+      create_indicator_collection: internal
+      list_indicator_collections: internal
+      get_indicator_collection: internal
+      update_indicator_collection: internal
+      delete_indicator_collection: internal
+      add_indicator_to_collection: internal
+      remove_indicator_from_collection: internal
+      list_indicator_collection_items: internal
+      reorder_indicator_collection_items: internal
+      set_indicator_collection_item_score: internal
+      list_indicator_collection_changes: internal
+      sync_indicator_collection: internal
+      # --- pipeline collections (scheduling domain) ---
+      create_pipeline_collection: internal
+      list_pipeline_collections: internal
+      get_pipeline_collection: internal
+      delete_pipeline_collection: internal
+      list_pipeline_items: internal
+      add_pipeline_item: internal
+      remove_pipeline_item: internal
+      enable_pipeline_item: internal
+      disable_pipeline_item: internal
+      update_pipeline_item: internal
+      sync_pipeline_cron: internal
+      # --- rule / indicator authoring + scoring ---
+      create_rule: internal
+      update_rule: internal
+      delete_rule: internal
+      create_indicator: internal
+      update_indicator: internal
+      set_indicator_score: internal
+      delete_indicator: internal
+
+  # Dashboard publishing (register/update/delete rewrite index.html + daas.md).
+  # Internal.
+  dashboard:
+    level: internal
+
+  # Routing infrastructure over data-fetch upstreams (config writes, tool
+  # calls, health transport flips). Internal.
+  gateway:
+    level: internal
+
+  # Research bundle workspace (CRUD, report generation, pipeline refresh).
+  # Internal.
+  research:
+    level: internal
+
+  # Workflow engine (manifest CRUD + runs). Internal.
+  workflow:
+    level: internal
+
+  # Local PDF/text vector search; ingest/delete write the local store.
+  # Internal.
+  pdf:
+    level: internal

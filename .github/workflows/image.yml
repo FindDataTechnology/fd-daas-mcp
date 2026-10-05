@@ -1,0 +1,59 @@
+# Container image publish — GitHub Actions → Tencent TCR personal edition.
+# Standard channel per openspec tcr-image-pipeline (2026-09-30 user directive).
+# Recipe: fd-proxy-service image.yml; this facade repo builds from the
+# fd-daas-mcp/ subdirectory (facet-mcp-foundation-v1 task 1.5).
+# Namespace mirrors the Harbor project the prod manifest pulled from
+# (100.64.0.8:30880/finddata/fd-daas-mcp), per docs/IMAGE-RELEASE.md.
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'fd-daas-mcp/**'
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: hkccr.ccs.tencentyun.com
+  NAMESPACE: finddata
+  IMAGE_NAME: fd-daas-mcp
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=main
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./fd-daas-mcp
+          file: ./fd-daas-mcp/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

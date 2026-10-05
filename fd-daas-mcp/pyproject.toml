@@ -1,6 +1,6 @@
 [project]
 name = "fd-daas-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Consolidated DAAS MCP server + CLI - hosts alerts/cron/composite/daas/dashboard/gateway/workflow tools behind one stdio server and one Click CLI"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -44,6 +44,9 @@ pdf = ["sentence-transformers", "sqlite-vec", "pdfplumber", "pypdf"]
 position = ["lxml", "cssselect", "jsonpath-ng"]
 # REPL history/autocomplete.
 repl = ["prompt_toolkit>=3.0"]
+# Catalog metadata sync to the data-machine Postgres (sync_postgres module;
+# stdlib sqlite3 reads the source, psycopg 3 writes the `daas` database).
+sync = ["psycopg[binary]>=3.1"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

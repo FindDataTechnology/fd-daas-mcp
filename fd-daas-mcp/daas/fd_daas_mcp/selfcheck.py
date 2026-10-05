@@ -6,6 +6,11 @@
   3. colliding leaf modules (registry_service, database) resolve to distinct files
   4. no APScheduler thread started (cron suppression worked)
   5. registration report: no core-group tool in ``failed``; optional-skipped listed
+  6. pdf optional group: registered or skipped_optional, never failed
+  7. default DB path never resolves inside the installed package
+  8. tool-surface manifest covers every registry group/tool (a new tool must be
+     graded in ``tool_surface.yaml``; commercial requires an explicit entry)
+  9. tool-surface manifest has no ghost entries (manifest-only tools/groups fail)
 
 ``main()`` additionally runs a best-effort gateway health probe (network:
 pings each http upstream, auto-flips transport on failure/recovery). A
@@ -16,7 +21,13 @@ server).
 The invariant logic lives in :func:`run_invariants` so it can be invoked both
 from the ``__main__`` CLI and from ``tests/test_selfcheck.py`` - same contract,
 no drift. The network probe is deliberately outside ``run_invariants`` so the
-offline contract (and the 7-check test) is preserved.
+offline contract (and the check-list test) is preserved.
+
+The tool-surface manifest (checks 8/9, facet-mcp-foundation-v1 task 2.2) lives
+at ``tool_surface.yaml`` next to this module. Consumer-side CI references
+:func:`commercial_tool_set` — the manifest's explicit commercial set as
+namespaced ``<group>_<tool>`` names — and asserts its own exposure set is a
+subset of it.
 
 Run: ``fd-daas-mcp/.venv/bin/python -m daas.fd_daas_mcp.selfcheck``
 """
@@ -59,6 +70,12 @@ DROPPED = {
 EXPECTED_COLLISIONS = {
     "create", "list", "get", "update", "delete",
 }
+
+# Tool-surface manifest (facet-mcp-foundation-v1): exposure levels, host forms,
+# and the manifest file sitting next to this module.
+SURFACE_LEVELS = {"commercial", "internal"}
+SURFACE_HOSTS = {"shared-readonly-catalog", "per-deployment-workspace", "local-stdio"}
+MANIFEST_PATH = Path(__file__).resolve().parent / "tool_surface.yaml"
 
 
 def run_invariants() -> dict[str, Any]:
@@ -142,13 +159,178 @@ def run_invariants() -> dict[str, Any]:
     # default must be cwd or ~/.fd-daas-mcp/daas.db, never the in-package path.
     checks.append(_check_default_db_not_in_package())
 
+    # [8][9] tool-surface manifest <-> registry (facet-mcp-foundation-v1 2.2):
+    # coverage (every registry tool graded; commercial must be explicit) and
+    # ghosts (no manifest-only entries). A malformed manifest fails both.
+    try:
+        manifest = load_manifest()
+        load_error = None
+    except Exception as e:  # noqa: BLE001
+        manifest, load_error = None, f"{type(e).__name__}: {e}"
+    if manifest is None:
+        checks.append({"name": "tool-surface-coverage", "ok": False,
+                       "detail": f"manifest load failed: {load_error}"})
+        checks.append({"name": "tool-surface-no-ghosts", "ok": False,
+                       "detail": f"manifest load failed: {load_error}"})
+        commercial: set[str] = set()
+    else:
+        cov, ghost = _tool_surface_checks(manifest, tools, rep["skipped_optional"])
+        checks.append(cov)
+        checks.append(ghost)
+        commercial = commercial_tool_set(manifest=manifest)
+
     return {
         "ok": all(c["ok"] for c in checks),
         "checks": checks,
         "report": rep,
         "tool_count": len(tools),
         "group_counts": dict(counts),
+        "commercial_tools": sorted(commercial),
     }
+
+
+def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
+    """Parse and shape-check the tool-surface manifest.
+
+    The default path is ``tool_surface.yaml`` next to this module. Raises
+    ``ValueError`` with a actionable message on structural violations (bad
+    version, unknown level/host, group without any grading, empty skills) so
+    both the selfcheck and consumer-side CI fail loudly on a malformed file.
+    """
+    import yaml  # noqa: PLC0415 - kept local so importing selfcheck never hard-requires pyyaml
+
+    p = Path(path) if path is not None else MANIFEST_PATH
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{p}: manifest must be a YAML mapping")
+    if data.get("manifest_version") != 1:
+        raise ValueError(f"{p}: unsupported manifest_version={data.get('manifest_version')!r}")
+    if not isinstance(data.get("server"), str) or not data["server"]:
+        raise ValueError(f"{p}: 'server' must be a non-empty string")
+    groups = data.get("groups")
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError(f"{p}: 'groups' must be a non-empty mapping")
+    for gname, gspec in groups.items():
+        gspec = gspec or {}
+        level = gspec.get("level")
+        tools = gspec.get("tools") or {}
+        if level is not None and level not in SURFACE_LEVELS:
+            raise ValueError(f"{p}: group '{gname}' level {level!r} not in {sorted(SURFACE_LEVELS)}")
+        if level is None and not tools:
+            raise ValueError(f"{p}: group '{gname}' needs a 'level' or a per-tool 'tools' map")
+        for tname, tlevel in tools.items():
+            if tlevel not in SURFACE_LEVELS:
+                raise ValueError(f"{p}: {gname}_{tname} level {tlevel!r} not in {sorted(SURFACE_LEVELS)}")
+    hosts = data.get("hosts")
+    if (not isinstance(hosts, list) or not hosts
+            or any(h not in SURFACE_HOSTS for h in hosts)):
+        raise ValueError(f"{p}: 'hosts' must be a non-empty list within {sorted(SURFACE_HOSTS)}")
+    skills = data.get("skills")
+    if not isinstance(skills, dict):
+        raise ValueError(f"{p}: 'skills' must be a mapping with consume/create lists")
+    for role in ("consume", "create"):
+        names = skills.get(role)
+        if (not isinstance(names, list) or not names
+                or any(not isinstance(s, str) or not s for s in names)):
+            raise ValueError(f"{p}: skills.{role} must be a non-empty list of skill names")
+    return data
+
+
+def resolve_surface_level(manifest: dict[str, Any], group: str, tool: str) -> str | None:
+    """Effective exposure level for ``(group, tool)``: the explicit per-tool
+    entry wins, else the group-level ``level``, else ``None`` (unclassified)."""
+    gspec = (manifest.get("groups") or {}).get(group) or {}
+    level = (gspec.get("tools") or {}).get(tool)
+    if level is None:
+        level = gspec.get("level")
+    return level
+
+
+def commercial_tool_set(manifest: dict[str, Any] | None = None,
+                        path: str | Path | None = None) -> set[str]:
+    """The manifest's commercial set as namespaced ``<group>_<tool>`` names.
+
+    Consumer-side CI (e.g. the business-mcp daas domain) asserts its exposure
+    set is a subset of this. Only EXPLICIT ``commercial`` entries count: the
+    selfcheck's coverage rule forbids inheriting commercial from a group-level
+    posture, so the explicit set is the complete commercial surface. Reads the
+    manifest only (no registry build, no group module loading), so it is cheap
+    and safe to import from foreign repos.
+    """
+    m = manifest if manifest is not None else load_manifest(path)
+    return {
+        registry.namespaced(group, tool)
+        for group, gspec in (m.get("groups") or {}).items()
+        for tool, level in ((gspec or {}).get("tools") or {}).items()
+        if level == "commercial"
+    }
+
+
+def _tool_surface_checks(manifest: dict[str, Any],
+                         tools: list[tuple[str, str, Any]],
+                         skipped_optional: list) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the two manifest<->registry checks (facet-mcp-foundation-v1 2.2).
+
+    Returns ``(coverage_check, ghost_check)``:
+
+    - coverage: every registry group exists in the manifest and every registry
+      tool resolves to a level; additionally a tool may only be commercial via
+      an EXPLICIT per-tool entry, so group-level ``commercial`` postures must
+      enumerate all their tools and a newly added tool can never silently
+      become commercial (it fails as unclassified/explicit-required instead).
+    - ghosts: every manifest group exists in ``registry.SOURCES`` and every
+      explicit manifest tool entry exists in the registry. Optional groups
+      skipped this run (dep absent) are excused from the tool-entry comparison.
+    """
+    registry_groups: dict[str, set[str]] = {}
+    for g, name, _ in tools:
+        registry_groups.setdefault(g, set()).add(name)
+    skipped = {g for g, _ in skipped_optional}
+    manifest_groups = manifest.get("groups") or {}
+
+    problems: list[str] = []
+    for g in sorted(registry_groups):
+        gspec = manifest_groups.get(g)
+        if gspec is None:
+            problems.append(f"group '{g}' not in manifest")
+            continue
+        explicit = gspec.get("tools") or {}
+        for t in sorted(registry_groups[g]):
+            level = resolve_surface_level(manifest, g, t)
+            if level is None:
+                problems.append(f"{registry.namespaced(g, t)}: unclassified (add it to the manifest)")
+            elif level == "commercial" and t not in explicit:
+                problems.append(f"{registry.namespaced(g, t)}: commercial via group default "
+                                f"(explicit per-tool entry required)")
+
+    ghosts: list[str] = []
+    for g, gspec in manifest_groups.items():
+        gspec = gspec or {}
+        if g not in registry.SOURCES:
+            ghosts.append(f"group '{g}' not in registry SOURCES")
+            continue
+        if g in skipped:
+            continue  # optional group not loaded this run (dep absent)
+        reg = registry_groups.get(g, set())
+        for t in sorted(gspec.get("tools") or {}):
+            if t not in reg:
+                ghosts.append(f"{registry.namespaced(g, t)}: manifest entry absent from registry")
+
+    total = sum(len(v) for v in registry_groups.values())
+    commercial_n = len(commercial_tool_set(manifest=manifest))
+    cap = lambda items: "; ".join(items[:12]) + (f" ... (+{len(items) - 12} more)" if len(items) > 12 else "")
+    coverage = {
+        "name": "tool-surface-coverage",
+        "ok": not problems,
+        "detail": (f"{total} tools across {len(registry_groups)} groups covered; "
+                   f"commercial={commercial_n}") if not problems else cap(problems),
+    }
+    ghost_check = {
+        "name": "tool-surface-no-ghosts",
+        "ok": not ghosts,
+        "detail": ("no ghost entries") if not ghosts else cap(ghosts),
+    }
+    return coverage, ghost_check
 
 
 def _check_default_db_not_in_package() -> dict[str, Any]:

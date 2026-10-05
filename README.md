@@ -16,7 +16,7 @@ Layered data platform for financial, economic, and statistical data — a single
 curl -fsSL https://raw.githubusercontent.com/FindDataTechnology/fd-daas-mcp/master/install.sh | sh
 ```
 
-That single command clones DAAS + the `fd-open-data-mcp` upstream, provisions both venvs, inits `daas.db`, and localizes `.mcp.json` to your paths. When it prints `done: ~/code/DAAS`, **161 MCP tools** and **18 Claude Code skills** are deployed and wired up — no further setup.
+That single command clones DAAS + the `fd-open-data-mcp` upstream, provisions both venvs, inits `daas.db`, and localizes `.mcp.json` to your paths. When it prints `done: ~/code/DAAS`, **160+ MCP tools** and **13 product Claude Code skills** are deployed and wired up — no further setup. (Exact tool count is runtime-defined — `selfcheck` is the source of truth; latest verified run: 161. `.claude/skills/` holds 32 directories in total, of which 13 are the product skills.)
 
 Now open the folder in your AI agent and ask in plain language:
 
@@ -32,13 +32,13 @@ Then just say things like:
 - *"alert me when RSI crosses 70"*
 - *"schedule this fetch nightly"*
 
-The agent has both surfaces ready — the **161 MCP tools** across 9 groups (`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`) auto-load from `.mcp.json`, and the **18 skills** under `.claude/skills/` are thin playbooks the agent invokes when a task matches (`fd-daas-based-data-fetch` handles resolve → fetch → persist, `fd-daas-research` orchestrates a full study, etc.).
+The agent has both surfaces ready — the **160+ MCP tools** across 9 groups (`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`) auto-load from `.mcp.json` (runtime count is authoritative — `selfcheck`), and the **13 product skills** under `.claude/skills/` are thin playbooks the agent invokes when a task matches (`fd-daas-based-data-fetch` handles resolve → fetch → persist, `fd-daas-research` orchestrates a full study, etc.).
 
 Verify the install is healthy (or just ask the agent to run them):
 
 ```bash
 fd-daas-mcp/.venv/bin/fd-daas-mcp doctor            # path + schema + row counts
-fd-daas-mcp/.venv/bin/python -m daas.fd_daas_mcp.selfcheck   # 161 tools, failed=0
+fd-daas-mcp/.venv/bin/python -m daas.fd_daas_mcp.selfcheck   # tool count (runtime is authoritative; latest: 161), failed=0
 ```
 
 A real first fetch (the agent runs the same thing when you ask it to):
@@ -48,11 +48,11 @@ uv run python .claude/skills/fd-daas-based-data-fetch/scripts/run_indicator.py S
 sqlite3 daas.db "SELECT source, COUNT(*) FROM observations GROUP BY source"
 ```
 
-> The Quick Start commands above are verified against this repo: `SPY_ma5` is a real `indicator_rules` row, and the `fd-daas-mcp` registry reports **161 tools across 9 sources** (`failed=0, skipped_optional=1` for the optional `pdf` group).
+> The Quick Start commands above are verified against this repo: `SPY_ma5` is a real `indicator_rules` row, and the `fd-daas-mcp` registry reports all **9 groups healthy** (`failed=0, skipped_optional=1` for the optional `pdf` group; latest verified run: 161 tools — runtime count is authoritative).
 
 Requirements: Python 3.10+ and `uv` — the script installs `uv` itself if it's missing. Env overrides: `DAAS_DEST` (default `~/code/DAAS`), `DAAS_BRANCH` (default `master`), `FINDDATA_HOME` (default `~/finddata`). `dartlab` fetches need 3.12: `uv run --python 3.12 --with dartlab ...`. Optional credentials (`HTTP_PROXY`, `EDGAR_IDENTITY`, `EDINET_API_KEY`, `LLM_*`, `ALERTS_FEISHU_WEBHOOK_URL`) go in a repo-root `.env` — see [Environment Variables](#environment-variables).
 
-> **Non-Claude-Code MCP client?** The 161 tools work in any MCP-aware client (Cursor, Cline, …). The skills are a Claude-Code convenience layer — optional, not required to drive the server.
+> **Non-Claude-Code MCP client?** The 160+ tools work in any MCP-aware client (Cursor, Cline, …). The skills are a Claude-Code convenience layer — optional, not required to drive the server.
 
 <details>
 <summary>Manual install (skip the curl script)</summary>
@@ -99,7 +99,7 @@ L0  fd-open-data-mcp       (sole data-fetch upstream; concept-based semantic fet
 ```
 
 - **L0 — fd-open-data-mcp** (sibling repo): the sole data-fetch surface. A concept-based semantic fetcher with ranking/failover/caching; holds the entity master (`entities`, `entity_datasource_links`). Served HTTP at `:8300` (stdio fallback). Replaces the 11 former per-source data-fetch MCPs.
-- **L1 — fd-daas-mcp** (this repo): the consolidated stdio server, sole entry in repo-root [`.mcp.json`](.mcp.json). Exposes **161 tools across 9 groups** (`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`) behind one server and one `fd-daas-mcp` Click CLI. The thin consolidation layer is `fd-daas-mcp/daas/fd_daas_mcp/` (`server.py`/`registry.py`/`cli.py`/`selfcheck.py`); each group's tool code lives in-package at `fd-daas-mcp/<group>-mcp/`.
+- **L1 — fd-daas-mcp** (this repo): the consolidated stdio server, sole entry in repo-root [`.mcp.json`](.mcp.json). Exposes **160+ tools across 9 groups** (runtime count is authoritative — `selfcheck`) (`daas · cron · alerts · dashboard · composite · research · pdf · gateway · workflow`) behind one server and one `fd-daas-mcp` Click CLI. The thin consolidation layer is `fd-daas-mcp/daas/fd_daas_mcp/` (`server.py`/`registry.py`/`cli.py`/`selfcheck.py`); each group's tool code lives in-package at `fd-daas-mcp/<group>-mcp/`.
 - **L2 — workflow manifests**: manifests live in the `workflows` table in `daas.db` (registered via `workflow_register`, run via `workflow_run`). `build_workflow_from_goal` decomposes a natural-language goal into a manifest via an LLM.
 - **L3 — user MCP composition**: a composite manifest (`{name, upstreams, tools, workflows, prompt}`) curates a named MCP surface served in-proc on the consolidated server. CRUD via `composite_*_manifest`.
 
@@ -114,7 +114,7 @@ For the full architecture, conventions, and the `daas.db` schema reference, see 
 ```
 daas/
 ├── .claude/skills/          # Claude Code skills (fd-daas-based-data-fetch is the core fetch shell)
-├── fd-daas-mcp/             # Consolidated MCP server — sole .mcp.json entry (161 tools, 9 groups)
+├── fd-daas-mcp/             # Consolidated MCP server — sole .mcp.json entry (160+ tools, 9 groups)
 │   ├── alerts-mcp/          #   alert rule engine + 7 notification channels
 │   ├── composite-mcp/       #   user MCP composition (curate tools + embed workflows + prompt)
 │   ├── cron-mcp/            #   task + schedule registry (DB-backed)
@@ -152,7 +152,7 @@ Query it directly from the repo root: `sqlite3 daas.db "SELECT …"`.
 
 ## Skills (`.claude/skills/`)
 
-Skills are plain Markdown (`SKILL.md`) + Python scripts — thin playbooks the agent invokes automatically when a task matches. The fetch skills gather parameters and call `workflow_run`; they no longer call Python data libraries directly (fetch goes L1→L0). **18 skills ship with the repo:**
+Skills are plain Markdown (`SKILL.md`) + Python scripts — thin playbooks the agent invokes automatically when a task matches. The fetch skills gather parameters and call `workflow_run`; they no longer call Python data libraries directly (fetch goes L1→L0). **13 product skills ship with the repo** (8 data-consumption + 5 creation; `.claude/skills/` holds 32 directories in total — the other 19 are the 5 `openspec-*` workflow skills and 14 local-dev helpers, which are repo tooling rather than product surface):
 
 | Skill | Purpose |
 |---|---|
@@ -174,7 +174,7 @@ Skills are plain Markdown (`SKILL.md`) + Python scripts — thin playbooks the a
 
 ## MCP Tool Groups (`fd-daas-mcp`)
 
-The consolidated server exposes **161 tools across 9 groups** (`failed=0, skipped_optional=1` for the optional `pdf` group). Catalog is group-level (per-tool detail via the server's own introspection / `selfcheck`).
+The consolidated server exposes **160+ tools across 9 groups** — runtime count is authoritative via `selfcheck` (latest verified run: 161 tools, `failed=0`, `skipped_optional=1` for the optional `pdf` group; the per-group counts below reflect that run). Catalog is group-level (per-tool detail via the server's own introspection / `selfcheck`).
 
 | Group | Prefix | Tools | Purpose |
 |---|---|---|---|
@@ -218,7 +218,7 @@ If you are an AI agent (e.g. Claude Code) operating in this repo:
 
 - **Fetch data through the workflow path.** Use `fd-daas-based-data-fetch`: resolve the entity + indicator against `daas.db` via `sqlite3`, then `workflow_run(name, params)` — the manifest routes the fetch down through `gateway_call` → `fd-open-data-mcp` (L0) and persists into `scraw_<slug>` / `observations`. For multi-step fetches, `build_workflow_from_goal` emits a manifest.
 - **Workflow:** resolve → fetch (via L0) → persist. Resolve entity+indicator in `daas.db`; fetch via the gateway; persist into `scraw_<slug>` (raw) or `observations` (computed indicator).
-- **Use the MCP server for everything else** — catalog browsing, creating indicators/collections/rules, cron scheduling, alerts, building/finding dashboards, PDF semantic search, composite authoring, research bundles. These are the `fd-daas-mcp` tools (161 across 9 groups).
+- **Use the MCP server for everything else** — catalog browsing, creating indicators/collections/rules, cron scheduling, alerts, building/finding dashboards, PDF semantic search, composite authoring, research bundles. These are the `fd-daas-mcp` tools (160+ across 9 groups; runtime count via `selfcheck`).
 - **Query `daas.db` with `sqlite3` from the repo root** (`sqlite3 daas.db "…"`). Use `PRAGMA foreign_keys=ON` for FK cascade.
 - **Authoritative architecture + schema reference:** [`CLAUDE.md`](CLAUDE.md) (it has a `## daas.db` section listing every table) and [`construction/mcp.md`](construction/mcp.md) (the layered L0/L1/L2/L3 reference).
 
