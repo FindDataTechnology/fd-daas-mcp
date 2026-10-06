@@ -147,6 +147,22 @@ from rule_tools import (
     run_rule,
     cli_run_rule,
 )
+# customer-dataset tools (client-owned data materialized in the cell data root;
+# wire-customer-local-data — upload/connector ingest, correction overlay).
+# Exposed on the merged fd-daas-mcp server as `daas_customer_dataset_*`.
+from customer_dataset_tools import (
+    customer_dataset_ingest_begin,
+    customer_dataset_ingest_chunk,
+    customer_dataset_ingest_commit,
+    customer_dataset_ingest_abort,
+    customer_dataset_overview,
+    customer_dataset_preview,
+    customer_dataset_correction_add,
+    customer_dataset_correction_list,
+    customer_dataset_correction_dangling,
+    customer_dataset_correction_revert,
+    customer_dataset_delete,
+)
 
 app.tool(list_sources)
 app.tool(search_functions)
@@ -242,6 +258,18 @@ app.tool(set_indicator_score)
 app.tool(delete_indicator)
 app.tool(run_indicator)
 app.tool(calculate_indicator)
+# customer-dataset tools (client-owned data; wire-customer-local-data)
+app.tool(customer_dataset_ingest_begin)
+app.tool(customer_dataset_ingest_chunk)
+app.tool(customer_dataset_ingest_commit)
+app.tool(customer_dataset_ingest_abort)
+app.tool(customer_dataset_overview)
+app.tool(customer_dataset_preview)
+app.tool(customer_dataset_correction_add)
+app.tool(customer_dataset_correction_list)
+app.tool(customer_dataset_correction_dangling)
+app.tool(customer_dataset_correction_revert)
+app.tool(customer_dataset_delete)
 
 if __name__ == "__main__":
     # CLI branches for cron-mcp shell tasks: run a path in-process and exit.
