@@ -35,7 +35,13 @@ ROWS = [
 
 
 def _t() -> dict:
-    return {n: fn for _, n, fn in registry.build()}
+    # the group is profile-gated (`cell`) — build under it, exactly as the
+    # wire cell's merged server does; keyed by the NAMESPACED wire-facing name
+    # (group prefix + tool name = the contract's customer_dataset_* form)
+    return {
+        registry.namespaced(g, n): fn
+        for g, n, fn in registry.build(profile="cell")
+    }
 
 
 def _seed(key: str, rows: list, pk: list | None = None, columns: list | None = None) -> dict:
@@ -292,23 +298,18 @@ def test_validation_errors():
 
 
 def test_registry_surface_and_namespacing():
-    names = {n for _, n, _ in registry.build()}
+    names = {n for _, n, _ in registry.build(profile="cell")}
     expected = {
-        "customer_dataset_ingest_begin",
-        "customer_dataset_ingest_chunk",
-        "customer_dataset_ingest_commit",
-        "customer_dataset_ingest_abort",
-        "customer_dataset_overview",
-        "customer_dataset_preview",
-        "customer_dataset_correction_add",
-        "customer_dataset_correction_list",
-        "customer_dataset_correction_dangling",
-        "customer_dataset_correction_revert",
-        "customer_dataset_delete",
+        "ingest_begin", "ingest_chunk", "ingest_commit", "ingest_abort",
+        "overview", "preview", "correction_add", "correction_list",
+        "correction_dangling", "correction_revert", "delete",
     }
     assert expected <= names
-    assert registry.namespaced("daas", "customer_dataset_preview") == "daas_customer_dataset_preview"
-    assert not expected & set(registry.collisions())
+    assert registry.namespaced("customer_dataset", "preview") == "customer_dataset_preview"
+    # plain `delete` legitimately joins the whitelisted generic-name
+    # collisions (create/list/get/update/delete); nothing else may collide
+    new_collisions = set(registry.collisions()) - {"create", "list", "get", "update", "delete"}
+    assert not expected & new_collisions
 
 
 def test_indicator_rule_reads_customer_table():
@@ -324,7 +325,7 @@ def test_indicator_rule_reads_customer_table():
     ]
     _seed("ts_a", rows, columns=cols)
     t = _t()
-    created = t["create_indicator"](
+    created = t["daas_create_indicator"](
         name="zz_cust_ts_a_level",
         datasource="cust_ts_a",
         source_table="cust_ts_a",
@@ -333,7 +334,7 @@ def test_indicator_rule_reads_customer_table():
         op="level",
     )
     assert "error" not in created, created
-    ran = t["run_indicator"](name="zz_cust_ts_a_level")
+    ran = t["daas_run_indicator"](name="zz_cust_ts_a_level")
     assert "error" not in ran, ran
 
     conn = get_database().engine.raw_connection()
@@ -363,7 +364,7 @@ def test_correction_feeds_the_rule_chain():
         dataset_key="ts_b", op="update", anchor=anchor, values={"value": 100.0}, actor="erin"
     )
     t = _t()
-    t["create_indicator"](
+    t["daas_create_indicator"](
         name="zz_cust_ts_b_level",
         datasource="cust_ts_b",
         source_table="cust_ts_b",
@@ -371,7 +372,7 @@ def test_correction_feeds_the_rule_chain():
         value_column="value",
         op="level",
     )
-    ran = t["run_indicator"](name="zz_cust_ts_b_level")
+    ran = t["daas_run_indicator"](name="zz_cust_ts_b_level")
     assert "error" not in ran, ran
     conn = get_database().engine.raw_connection()
     try:

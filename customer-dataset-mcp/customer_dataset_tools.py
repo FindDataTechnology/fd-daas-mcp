@@ -26,13 +26,23 @@ import hashlib
 import json
 import os
 import re
+import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
-from daas_database import get_database
-from models import CustomerDataset, CustomerDatasetCorrection, CustomerDatasetIngest
+# Group dirs are self-contained (research-mcp precedent: own database accessor),
+# but the cell data root is ONE SQLite file shared with the daas group — resolve
+# the sibling daas-mcp dir for the engine singleton regardless of sys.path
+# order (load_source pops the group dir when done).
+_DAAS_MCP_DIR = Path(__file__).resolve().parents[1] / "daas-mcp"
+if str(_DAAS_MCP_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAAS_MCP_DIR))
+
+from daas_database import get_database  # noqa: E402
+from models import CustomerDataset, CustomerDatasetCorrection, CustomerDatasetIngest  # noqa: E402
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _COL_RE = re.compile(r'^[^\x00-\x1f"]{1,64}$')
@@ -741,7 +751,7 @@ def _err(e: Exception) -> dict:
     return {"success": False, "error": str(e)}
 
 
-def customer_dataset_ingest_begin(
+def ingest_begin(
     dataset_key: str,
     columns: list,
     pk_columns: Optional[list] = None,
@@ -766,7 +776,7 @@ def customer_dataset_ingest_begin(
         return _err(e)
 
 
-def customer_dataset_ingest_chunk(ingest_id: str, rows: list, start_index: int) -> dict:
+def ingest_chunk(ingest_id: str, rows: list, start_index: int) -> dict:
     """Append one chunk of rows to an open ingest. `start_index` must equal the
     number of rows already staged (guards against replays)."""
     svc = _svc()
@@ -776,7 +786,7 @@ def customer_dataset_ingest_chunk(ingest_id: str, rows: list, start_index: int) 
         return _err(e)
 
 
-def customer_dataset_ingest_commit(ingest_id: str) -> dict:
+def ingest_commit(ingest_id: str) -> dict:
     """Atomically swap the staged snapshot into the base table, rebuild the
     effective table and replay all active corrections (dangling anchors are
     marked, never dropped). Returns rows/size/corrections stats."""
@@ -787,7 +797,7 @@ def customer_dataset_ingest_commit(ingest_id: str) -> dict:
         return _err(e)
 
 
-def customer_dataset_ingest_abort(ingest_id: str) -> dict:
+def ingest_abort(ingest_id: str) -> dict:
     """Abort an open ingest and drop its staging table (base/effective stay)."""
     svc = _svc()
     try:
@@ -796,7 +806,7 @@ def customer_dataset_ingest_abort(ingest_id: str) -> dict:
         return _err(e)
 
 
-def customer_dataset_overview(dataset_key: str) -> dict:
+def overview(dataset_key: str) -> dict:
     """Dataset metadata: columns, pk_columns, rows, size_bytes, last_commit_at."""
     svc = _svc()
     try:
@@ -805,7 +815,7 @@ def customer_dataset_overview(dataset_key: str) -> dict:
         return _err(e)
 
 
-def customer_dataset_preview(
+def preview(
     dataset_key: str, limit: int = 50, offset: int = 0, include_corrected: bool = True
 ) -> dict:
     """Paged row preview with `__row_id` anchors. `include_corrected=false`
@@ -817,7 +827,7 @@ def customer_dataset_preview(
         return _err(e)
 
 
-def customer_dataset_correction_add(
+def correction_add(
     dataset_key: str, op: str, anchor: Optional[str] = None, values: Optional[dict] = None, actor: str = ""
 ) -> dict:
     """Add an overlay correction (update/delete/insert); it applies to the
@@ -829,7 +839,7 @@ def customer_dataset_correction_add(
         return _err(e)
 
 
-def customer_dataset_correction_list(
+def correction_list(
     dataset_key: str, include_reverted: bool = False, include_dangling: bool = True
 ) -> dict:
     """Correction history (audit trail) for a dataset."""
@@ -840,7 +850,7 @@ def customer_dataset_correction_list(
         return _err(e)
 
 
-def customer_dataset_correction_dangling(dataset_key: str) -> dict:
+def correction_dangling(dataset_key: str) -> dict:
     """Corrections whose row anchor no longer matches the latest snapshot."""
     svc = _svc()
     try:
@@ -849,7 +859,7 @@ def customer_dataset_correction_dangling(dataset_key: str) -> dict:
         return _err(e)
 
 
-def customer_dataset_correction_revert(dataset_key: str, correction_id: int, actor: str = "") -> dict:
+def correction_revert(dataset_key: str, correction_id: int, actor: str = "") -> dict:
     """Revert one correction (mark reverted; rebuild the effective table from
     the base snapshot plus the remaining active corrections)."""
     svc = _svc()
@@ -859,7 +869,7 @@ def customer_dataset_correction_revert(dataset_key: str, correction_id: int, act
         return _err(e)
 
 
-def customer_dataset_delete(dataset_key: str, actor: str = "") -> dict:
+def delete(dataset_key: str, actor: str = "") -> dict:
     """Delete a dataset: drop its three tables, metadata, corrections and
     soft-reference rows. Ingest audit rows are kept."""
     svc = _svc()

@@ -173,20 +173,13 @@ groups:
       update_indicator: internal
       set_indicator_score: internal
       delete_indicator: internal
-      # --- customer datasets (client-owned data in the cell data root;
-      # wire-customer-local-data). Cell-local and client-private: never part
-      # of the commercial catalog surface — all internal, reads included. ---
-      customer_dataset_ingest_begin: internal
-      customer_dataset_ingest_chunk: internal
-      customer_dataset_ingest_commit: internal
-      customer_dataset_ingest_abort: internal
-      customer_dataset_overview: internal
-      customer_dataset_preview: internal
-      customer_dataset_correction_add: internal
-      customer_dataset_correction_list: internal
-      customer_dataset_correction_dangling: internal
-      customer_dataset_correction_revert: internal
-      customer_dataset_delete: internal
+
+  # Client-owned datasets (wire cell only — deployment profile `cell`;
+  # wire-customer-local-data + ADR-0001). Cell-local and client-private: never
+  # part of the commercial catalog surface — group-level internal covers all
+  # eleven tools (reads included).
+  customer_dataset:
+    level: internal
 
   # Dashboard publishing (register/update/delete rewrite index.html + daas.md).
   # Internal.

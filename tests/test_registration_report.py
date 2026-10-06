@@ -6,10 +6,12 @@ from daas.fd_daas_mcp import registry
 CORE = {"alerts", "cron", "composite", "daas", "dashboard", "gateway"}
 
 
-def test_report_has_three_keys():
+def test_report_keys():
     registry.build()
     rep = registry.build_report()
-    assert set(rep.keys()) == {"registered", "failed", "skipped_optional"}
+    assert set(rep.keys()) == {
+        "registered", "failed", "skipped_optional", "skipped_profile", "profile",
+    }
 
 
 def test_every_core_group_has_at_least_one_registered_tool():

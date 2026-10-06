@@ -26,6 +26,14 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fd-daas-mcp")
 
+# The single FastMCP app the consolidated server runs. The registry harvests
+# per-group tool functions and we register them on this `app`; the inline=True
+# groups (alerts/cron/dashboard) also have their own per-module `app` (from
+# their own server.py) but those module-level FastMCP instances are never
+# served - their @app.tool decorator's only job is to attach the function
+# object to that module so registry.load_source() can extract it back out.
+app = FastMCP("fd-daas-mcp")
+
 
 class BearerAuthMiddleware:
     """ASGI middleware gating HTTP requests behind a bearer token.
@@ -84,21 +92,36 @@ try:
 except Exception as _e:  # noqa: BLE001 - provisioning must not block server start
     logger.warning("fd-daas-mcp database provisioning failed: %s", _e)
 
-_tools = registry.build()
-for _group, _name, _func in _tools:
+
+def _register_tools(profile: str | None) -> None:
+    """Build the registry under ``profile`` and register every tool on ``app``.
+
+    Deferred to startup (not import time) so ``--profile``/``DAAS_PROFILE`` can
+    decide the tool surface; unknown profiles fail fast here.
+    """
     try:
-        app.tool(name=registry.namespaced(_group, _name))(_func)
-    except Exception as e:  # noqa: BLE001 - record + keep going; surfaced via report
-        registry.note_failed(_group, _name, f"{type(e).__name__}: {e}")
-        logger.warning("failed to register %s_%s: %s", _group, _name, e)
+        registry.validate_profile(profile)
+    except ValueError as e:
+        raise SystemExit(f"[fd-daas-mcp] {e}")
+    _tools = registry.build(profile=profile)
+    for _group, _name, _func in _tools:
+        try:
+            app.tool(name=registry.namespaced(_group, _name))(_func)
+        except Exception as e:  # noqa: BLE001 - record + keep going; surfaced via report
+            registry.note_failed(_group, _name, f"{type(e).__name__}: {e}")
+            logger.warning("failed to register %s_%s: %s", _group, _name, e)
 
-_report = registry.build_report()
-logger.info("fd-daas-mcp server: registered=%d failed=%d skipped_optional=%d",
-            len(_report["registered"]), len(_report["failed"]),
-            len(_report["skipped_optional"]))
+    _report = registry.build_report(profile)
+    logger.info(
+        "fd-daas-mcp server (profile=%s): registered=%d failed=%d skipped_optional=%d"
+        " skipped_profile=%s",
+        profile or "default", len(_report.get("registered", [])),
+        len(_report.get("failed", [])), len(_report.get("skipped_optional", [])),
+        _report.get("skipped_profile", []),
+    )
 
 
-def main(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8311) -> None:
+def main(transport=None, host=None, port=None, profile=None) -> None:
     """Run the fd-daas-mcp server.
 
     ``MCP_TRANSPORT`` / ``MCP_HOST`` / ``MCP_PORT`` env vars provide the
@@ -108,7 +131,18 @@ def main(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8311) ->
     ``http://<host>:<port>/mcp`` (host defaults to 127.0.0.1, port to 8311).
     When ``MCP_BEARER_TOKEN`` is set, HTTP requests must carry the matching
     bearer token (401 otherwise).
+
+    The deployment profile (``--profile`` arg, falling back to
+    ``DAAS_PROFILE`` env) selects which tool groups load (ADR-0001); an
+    unknown profile refuses to start.
+
+    Note: defaults are ``None`` (not ``"stdio"``/``"127.0.0.1"``/``8311``)
+    so the env-var fallbacks actually apply — a default of ``"127.0.0.1"`` is
+    truthy and would shadow ``MCP_HOST=0.0.0.0`` when the caller passes no
+    argument.
     """
+    profile = profile or os.environ.get("DAAS_PROFILE", "").strip() or None
+    _register_tools(profile)
     transport = transport or os.environ.get("MCP_TRANSPORT") or "stdio"
     if transport == "stdio":
         app.run(transport="stdio", show_banner=False)
@@ -141,53 +175,18 @@ def _run_cli() -> None:
     @click.option("--transport", type=click.Choice(["stdio", "http"]), default="stdio")
     @click.option("--host", default="127.0.0.1", show_default=True)
     @click.option("--port", default=8311, show_default=True, type=int)
-    def serve(transport, host, port):
+    @click.option("--profile", default=None,
+                  help="部署画像 local|cell|dev（缺省=通用组；env DAAS_PROFILE 同义）")
+    def serve(transport, host, port, profile):
         """Serve the MCP server."""
-        main(transport=transport, host=host, port=port)
+        main(transport=transport, host=host, port=port, profile=profile)
 
     cli()
 
 
 if __name__ == "__main__":
-    # Check if we were invoked as CLI with serve subcommand
-    if len(sys.argv) > 1 and sys.argv[1] == "serve":
-        import click
-        ctx = click.Context(click.Command("serve"))
-        # Parse remaining args as serve options
-        remaining = sys.argv[2:] if len(sys.argv) > 2 else []
-        try:
-            # Use Click's parser to handle --transport --host --port flags
-            from click.testing import CliRunner
-            runner = CliRunner()
-            result = runner.invoke(cli, ["serve"] + remaining, prog_name="fd-daas-mcp", standalone_mode=False)
-            if result.exception:
-                raise result.exception
-        except SystemExit:
-            pass
-    else:
-        # Default: run main() (stdio by default, respects MCP_TRANSPORT env)
-        import subprocess
-        # Re-invoke with proper Click parsing for serve mode
-        import sys
-        args = sys.argv[1:]
-        transport = None
-        host = "127.0.0.1"
-        port = 8311
-
-        i = 0
-        while i < len(args):
-            if args[i] == "--transport" and i + 1 < len(args):
-                transport = args[i + 1]
-                i += 2
-            elif args[i] == "--host":
-                host = args[i + 1] if i + 1 < len(args) else host
-                i += 2
-            elif args[i] == "--port":
-                port = int(args[i + 1]) if i + 1 < len(args) else port
-                i += 2
-            else:
-                i += 1
-
-        main(transport=transport or os.environ.get("MCP_TRANSPORT"),
-             host=os.environ.get("MCP_HOST") or host,
-             port=int(os.environ.get("MCP_PORT", port)))
+    # When invoked as `python -m daas.fd_daas_mcp.server [flags]`, dispatch to
+    # main() which reads MCP_TRANSPORT/MCP_HOST/MCP_PORT env vars. The CLI
+    # entrypoint (`fd-daas-mcp serve --transport ... --host ... --port ...`)
+    # in cli.py calls main() directly with parsed args.
+    main()
