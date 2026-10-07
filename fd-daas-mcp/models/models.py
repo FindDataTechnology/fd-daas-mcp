@@ -1616,3 +1616,108 @@ class PdfMeta(Base):
     key = Column(String(64), primary_key=True)
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+# ═══════════════════════════════════════════════════════════════
+# customer-dataset domain — client-owned data materialized in the
+# cell data root (wire-customer-local-data, capability
+# wire-customer-datasets). Physical layout per dataset:
+#   cust_<key>            effective table (base snapshot + corrections)
+#   cust_<key>__base      raw snapshot (original values stay queryable)
+#   cust_<key>__staging   in-flight full snapshot during ingest
+# These ORM tables hold metadata + the correction overlay + ingest audit.
+# ═══════════════════════════════════════════════════════════════
+
+
+class CustomerDataset(Base):
+    """One client data set (1:1 with a source table or file)."""
+
+    __tablename__ = "customer_datasets"
+    __table_args__ = (UniqueConstraint("key", name="uq_customer_dataset_key"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(64), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    columns_json = Column(JSON, nullable=False)
+    pk_columns_json = Column(JSON, nullable=True)
+    row_count = Column(Integer, nullable=False, default=0)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    last_commit_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "name": self.name,
+            "columns": self.columns_json or [],
+            "pk_columns": self.pk_columns_json or [],
+            "rows": self.row_count or 0,
+            "size_bytes": self.size_bytes or 0,
+            "last_commit_at": self.last_commit_at.isoformat() if self.last_commit_at else None,
+        }
+
+
+class CustomerDatasetCorrection(Base):
+    """One overlay edit (update/delete/insert) anchored to a row of the
+    dataset's snapshot. Replayed after every commit; anchors that no longer
+    match are marked dangling (kept, never silently dropped)."""
+
+    __tablename__ = "customer_dataset_corrections"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_key = Column(String(64), nullable=False, index=True)
+    op = Column(String(16), nullable=False)  # update | delete | insert
+    anchor = Column(Text, nullable=False)  # pk:<json> | hash:<hex> | ins:<id>
+    values_json = Column(JSON, nullable=True)
+    old_values_json = Column(JSON, nullable=True)
+    actor = Column(String(255), nullable=False, default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    reverted_at = Column(DateTime, nullable=True)
+    dangling_at = Column(DateTime, nullable=True)
+    dangling_reason = Column(String(255), nullable=True)
+
+    def to_dict(self) -> dict:
+        fmt = lambda v: v.isoformat() if v else None  # noqa: E731
+        return {
+            "id": self.id,
+            "dataset_key": self.dataset_key,
+            "op": self.op,
+            "row_id": self.anchor,
+            "values": self.values_json,
+            "old_values": self.old_values_json,
+            "actor": self.actor,
+            "created_at": fmt(self.created_at),
+            "reverted_at": fmt(self.reverted_at),
+            "dangling_at": fmt(self.dangling_at),
+            "dangling_reason": self.dangling_reason,
+        }
+
+
+class CustomerDatasetIngest(Base):
+    """Audit trail of ingest attempts (open → committed/aborted; a `deleted`
+    row is written when the dataset itself is removed)."""
+
+    __tablename__ = "customer_dataset_ingests"
+
+    id = Column(String(36), primary_key=True)
+    dataset_key = Column(String(64), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="open")
+    row_count = Column(Integer, nullable=True)
+    actor = Column(String(255), nullable=False, default="")
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    finished_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+
+    def to_dict(self) -> dict:
+        fmt = lambda v: v.isoformat() if v else None  # noqa: E731
+        return {
+            "id": self.id,
+            "dataset_key": self.dataset_key,
+            "status": self.status,
+            "row_count": self.row_count,
+            "actor": self.actor,
+            "started_at": fmt(self.started_at),
+            "finished_at": fmt(self.finished_at),
+            "error": self.error,
+        }

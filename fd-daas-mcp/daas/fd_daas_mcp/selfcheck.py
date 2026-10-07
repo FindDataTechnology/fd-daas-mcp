@@ -78,17 +78,20 @@ SURFACE_HOSTS = {"shared-readonly-catalog", "per-deployment-workspace", "local-s
 MANIFEST_PATH = Path(__file__).resolve().parent / "tool_surface.yaml"
 
 
-def run_invariants() -> dict[str, Any]:
+def run_invariants(profile: str | None = None) -> dict[str, Any]:
     """Run every selfcheck invariant and return a structured result.
 
-    Returns ``{"ok": bool, "checks": [...], "report": {...},
-    "tool_count": int, "group_counts": {...}}`` where each check is
-    ``{"name", "ok", "detail"}``. ``ok`` is True only if every check passed.
+    ``profile`` selects the deployment profile the registry builds under
+    (None = default/universal groups); the tool-surface checks excuse groups
+    gated off by that profile. Returns ``{"ok": bool, "checks": [...],
+    "report": {...}, "tool_count": int, "group_counts": {...}}`` where each
+    check is ``{"name", "ok", "detail"}``. ``ok`` is True only if every check
+    passed.
     """
     registry.reset_cache()
-    tools = registry.build()
+    tools = registry.build(profile)
     counts = Counter(g for g, _, _ in tools)
-    rep = registry.build_report()
+    rep = registry.build_report(profile)
 
     checks: list[dict[str, Any]] = []
 
@@ -174,7 +177,12 @@ def run_invariants() -> dict[str, Any]:
                        "detail": f"manifest load failed: {load_error}"})
         commercial: set[str] = set()
     else:
-        cov, ghost = _tool_surface_checks(manifest, tools, rep["skipped_optional"])
+        cov, ghost = _tool_surface_checks(
+            manifest, tools,
+            list(rep["skipped_optional"])
+            + [(g, f"profile-gated (active={rep.get('profile') or 'default'})")
+               for g in rep.get("skipped_profile", [])],
+        )
         checks.append(cov)
         checks.append(ghost)
         commercial = commercial_tool_set(manifest=manifest)

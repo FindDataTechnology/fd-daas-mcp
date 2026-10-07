@@ -147,6 +147,9 @@ from rule_tools import (
     run_rule,
     cli_run_rule,
 )
+# customer-dataset tools moved to their own group (customer-dataset-mcp/,
+# deployment profile `cell`) — see registry.SOURCES + ADR-0001; the merged
+# server exposes them as `customer_dataset_*`.
 
 app.tool(list_sources)
 app.tool(search_functions)
@@ -242,6 +245,8 @@ app.tool(set_indicator_score)
 app.tool(delete_indicator)
 app.tool(run_indicator)
 app.tool(calculate_indicator)
+# customer-dataset tools live in their own group now (customer-dataset-mcp/,
+# profile `cell`) — the merged server loads them from there.
 
 if __name__ == "__main__":
     # CLI branches for cron-mcp shell tasks: run a path in-process and exit.

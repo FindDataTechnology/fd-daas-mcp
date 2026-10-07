@@ -27,6 +27,29 @@ logger = logging.getLogger("fd-daas-mcp")
 REPO = Path(__file__).resolve().parents[3]  # daas/fd_daas_mcp/registry.py -> repo root
 FD_HOME = REPO / "fd-daas-mcp"
 
+#: 部署画像（ADR-0001）：组在 SOURCES 声明 profiles，合并服务按画像装载；
+#: 无 profiles 字段=通用组（全画像加载，缺省向后兼容）；dev=全量。
+PROFILES: tuple[str, ...] = ("local", "cell", "dev")
+
+
+def validate_profile(profile: str | None) -> str | None:
+    """Unknown profile values fail fast — a mis-set profile silently changes
+    the tool surface, which is worse than a refused start (same philosophy as
+    the tool-surface manifest's no-silent-commercial rule)."""
+    if profile is None:
+        return None
+    if profile not in PROFILES:
+        raise ValueError(f"未知部署画像 {profile!r}；合法值: {', '.join(PROFILES)}")
+    return profile
+
+
+def _group_active(spec: dict[str, Any], profile: str | None) -> bool:
+    """组级画像门控：无 profiles 声明=通用组；dev 装载一切；其余按声明。"""
+    declared = spec.get("profiles")
+    if not declared or profile == "dev":
+        return True
+    return profile is not None and profile in declared
+
 SOURCES: dict[str, dict[str, Any]] = {
     "alerts":    {"dir": "alerts-mcp",    "inline": True},
     "cron":      {"dir": "cron-mcp",      "inline": True,  "suppress": True},
@@ -53,6 +76,12 @@ SOURCES: dict[str, dict[str, Any]] = {
     # openspec/changes/add-pdf-vector-search.
     "pdf":       {"dir": "pdf-mcp",       "inline": False, "optional": True, "dep": "sqlite_vec"},
     # To add another OPTIONAL group, give it ``"optional": True`` and ``"dep": "<import>"``.
+    #
+    # Client-owned datasets (wire cells only — deployment profile ``cell``;
+    # wire-customer-local-data + ADR-0001). Split out of the core daas group so
+    # the 謙面 local profile never loads it: the tool namespace returns to the
+    # contract's original ``customer_dataset_*`` (no daas_ prefix).
+    "customer_dataset": {"dir": "customer-dataset-mcp", "inline": False, "profiles": ["cell"]},
     #
     # Dropped groups - lost with the prior fd-daas-mcp and not tracked for
     # restore here. Each has an archived openspec spec to restore from:
@@ -224,8 +253,8 @@ def load_source(group: str) -> tuple[list[tuple[str, str, Callable]], list[str]]
         _evict_source_modules()
 
 
-_BUILD_CACHE: list[tuple[str, str, Callable]] | None = None
-_BUILD_REPORT: dict[str, list] | None = None
+_BUILD_CACHE: dict[str, list[tuple[str, str, Callable]]] | None = None
+_BUILD_REPORT: dict[str, dict[str, list]] | None = None
 
 
 def _can_import(modname: str) -> bool:
@@ -237,19 +266,35 @@ def _can_import(modname: str) -> bool:
         return False
 
 
-def build() -> list[tuple[str, str, Callable]]:
+def build(profile: str | None = None) -> list[tuple[str, str, Callable]]:
     global _BUILD_CACHE, _BUILD_REPORT
-    if _BUILD_CACHE is not None:
-        return _BUILD_CACHE
+    profile = validate_profile(profile)
+    cache_key = profile or ""
+    cached = (_BUILD_CACHE or {}).get(cache_key)
+    if cached is not None:
+        return cached
 
     models_dir = REPO / "fd-daas-mcp" / "models"
     if str(models_dir) not in sys.path:
         sys.path.insert(0, str(models_dir))
 
-    report: dict[str, list] = {"registered": [], "failed": [], "skipped_optional": []}
+    report: dict[str, list] = {
+        "registered": [], "failed": [], "skipped_optional": [], "skipped_profile": [],
+        "profile": [profile] if profile else [],
+    }
     all_tools: list[tuple[str, str, Callable]] = []
     for group in SOURCES:
         spec = SOURCES[group]
+        # Deployment-profile gating (ADR-0001): groups declaring ``profiles``
+        # load only under those profiles (dev loads everything); undeclared =
+        # universal. A profile-skipped group is recorded as skipped_profile
+        # (INFO), mirroring skipped_optional, and excused from the tool-surface
+        # manifest's ghost check.
+        if not _group_active(spec, profile):
+            report["skipped_profile"].append(group)
+            logger.info("source %s skipped (profile %r not in %s)",
+                        group, profile, spec.get("profiles"))
+            continue
         # Optional groups load only when their backing dep is importable; an
         # absent dep is recorded as skipped_optional (INFO), not a failure.
         if spec.get("optional"):
@@ -270,41 +315,54 @@ def build() -> list[tuple[str, str, Callable]]:
         for name in missing:
             report["failed"].append((group, name, "unresolvable at load"))
 
-    logger.info("registry: %d tools across %d sources (failed=%d, skipped_optional=%d)",
-                len(all_tools), len(SOURCES),
-                len(report["failed"]), len(report["skipped_optional"]))
-    _BUILD_CACHE = all_tools
-    _BUILD_REPORT = report
+    logger.info("registry: %d tools across %d sources (profile=%s, failed=%d, skipped_optional=%d, skipped_profile=%s)",
+                len(all_tools), len(SOURCES), profile or "default",
+                len(report["failed"]), len(report["skipped_optional"]),
+                report["skipped_profile"])
+    _BUILD_CACHE = _BUILD_CACHE or {}
+    _BUILD_CACHE[cache_key] = all_tools
+    _BUILD_REPORT = _BUILD_REPORT or {}
+    _BUILD_REPORT[cache_key] = report
     return all_tools
 
 
-def build_report() -> dict[str, list]:
-    """Structured registration report: registered / failed / skipped_optional.
+def build_report(profile: str | None = None) -> dict[str, list]:
+    """Structured registration report: registered / failed / skipped_optional /
+    skipped_profile / profile.
 
     Populated by ``build()`` (load stage) and ``note_failed()`` (server
     ``app.tool`` stage). ``registered`` lists tools that loaded; ``failed`` lists
     load-time and app.tool-registration failures as ``(group, name, error)``;
-    ``skipped_optional`` lists optional groups whose dependency was absent.
+    ``skipped_optional`` lists optional groups whose dependency was absent;
+    ``skipped_profile`` lists groups gated off by the active deployment profile.
     """
     if _BUILD_REPORT is None:
-        build()
-    return _BUILD_REPORT  # type: ignore[return-value]
+        build(profile)
+    return (_BUILD_REPORT or {}).get(profile or "") or {}
 
 
 def note_failed(group: str, name: str, error: str) -> None:
     """Record a tool that failed to register with the FastMCP app (server-side).
 
     Called from ``server.py``'s per-tool registration loop so an app.tool failure
-    is surfaced in the report rather than only logged.
+    is surfaced in the report rather than only logged. An app.tool failure is
+    per-loaded-tool, so it is appended to every cached profile's report that
+    actually registered that group.
     """
     if _BUILD_REPORT is None:
         build()
-    _BUILD_REPORT["failed"].append((group, name, f"app.tool: {error}"))
+    for report in (_BUILD_REPORT or {}).values():
+        if any(g == group for g, _ in report.get("registered", [])) or \
+                any(g == group and n == name for g, n, _ in report.get("failed", [])):
+            report["failed"].append((group, name, f"app.tool: {error}"))
 
 
 def core_groups() -> list[str]:
-    """Groups that are not optional - a failure here fails the selfcheck loudly."""
-    return [g for g, s in SOURCES.items() if not s.get("optional")]
+    """Groups that are not optional and not profile-gated — a failure here
+    fails the selfcheck loudly. Profile-gated groups (ADR-0001) load only
+    under their declared profiles, so they are not "core" by definition."""
+    return [g for g, s in SOURCES.items()
+            if not s.get("optional") and not s.get("profiles")]
 
 
 def reset_cache() -> None:
