@@ -121,6 +121,7 @@ def test_correction_add_writes_wal_row():
         "anchor": anchor,
         "correction_id": added["correction_id"],
         "actor": "alice",
+        "channel": "console",
     }
     assert _ISO_Z.match(created_at), created_at
     assert acked == 0  # fresh events await the forwarder
@@ -198,6 +199,7 @@ def test_pending_ack_roundtrip_and_idempotency():
     assert events[1]["payload"] == {
         "dataset_key": "rt_a", "op": "update", "anchor": anchor,
         "correction_id": add1["correction_id"], "actor": "alice",
+        "channel": "console",
     }
     seqs = [e["seq"] for e in events]
     assert seqs == sorted(seqs)

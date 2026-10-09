@@ -139,6 +139,39 @@ class Database:
         self._migrate_indicator_collections_rule_id()
         self._migrate_legacy_rule_scripts_to_rules()
         self._migrate_drop_process_rules()
+        self._migrate_customer_corrections_channel()
+
+    def _migrate_customer_corrections_channel(self) -> None:
+        """Idempotent: add channel attribution columns (wire-customer-data-engine
+        §2, ADR-0006) to a pre-existing ``customer_dataset_corrections`` table.
+        create_all adds them on fresh DBs but won't ALTER an existing table.
+        ponytail: additive only, no destructive migration."""
+        insp = inspect(self._engine)
+        if "customer_dataset_corrections" not in insp.get_table_names():
+            return
+        cols = [c["name"] for c in insp.get_columns("customer_dataset_corrections")]
+        with self._engine.begin() as conn:
+            if "channel" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE customer_dataset_corrections"
+                        " ADD COLUMN channel VARCHAR(16) NOT NULL DEFAULT 'console'"
+                    )
+                )
+            if "actor_id" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE customer_dataset_corrections"
+                        " ADD COLUMN actor_id VARCHAR(255)"
+                    )
+                )
+            if "actor_label" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE customer_dataset_corrections"
+                        " ADD COLUMN actor_label VARCHAR(255)"
+                    )
+                )
 
     def _migrate_sources_category_id(self) -> None:
         """Idempotent: add `category_id` to a pre-existing `sources` table.
