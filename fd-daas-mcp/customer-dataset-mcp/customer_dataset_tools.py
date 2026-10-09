@@ -1243,6 +1243,7 @@ class CustomerDatasetService:
         columns = [c["name"] for c in (meta.columns_json or [])]
         pk_columns = list(meta.pk_columns_json or [])
         checked: list[tuple[str, Optional[str], dict]] = []
+        inserts = 0
         for i, entry in enumerate(ops):
             if not isinstance(entry, dict):
                 raise CustomerDatasetError(f"第 {i + 1} 条不是对象: {entry!r}")
@@ -1252,7 +1253,18 @@ class CustomerDatasetService:
                 )
             except CustomerDatasetError as exc:
                 raise CustomerDatasetError(f"第 {i + 1} 条失败: {exc}") from exc
+            if op == "insert":
+                inserts += 1
             checked.append((op, entry.get("anchor"), values))
+        # 行数上限对批量写同样生效（app 主库场景 insert 累积，不得绕过
+        # ingest_commit 的行数门——wire-customer-datasets 行数上限要求）
+        if inserts:
+            current = _raw_query_one(f"SELECT COUNT(*) FROM {_quote(_table_name(dataset_key))}")[0]
+            limit = _max_rows()
+            if int(current) + inserts > limit:
+                raise CustomerDatasetError(
+                    f"批量写后行数 {int(current) + inserts} 将超过上限 {limit}（整批拒绝）"
+                )
         with _tx() as cur:
             correction_ids: list[int] = []
             for i, (op, anchor, values) in enumerate(checked):

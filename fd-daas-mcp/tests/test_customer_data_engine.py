@@ -730,3 +730,21 @@ class TestJoinIndicators:
         rr = t["customer_dataset_derive_refresh"](child_key=child)
         assert "error" not in rr and rr.get("refreshed") is True
         assert t["customer_dataset_query"](dataset_key=child)["rows"][0]["gdp"] == 2.0
+
+
+class TestWriteBatchRowCap:
+    def test_inserts_beyond_cap_reject_whole_batch(self, monkeypatch):
+        src = _key("cap")
+        _seed(src)
+        t = _t()
+        # registry.build 每次构建都是新模块实例——patch 活模块的工具 globals
+        g = t["customer_dataset_write_batch"].__globals__
+        monkeypatch.setitem(g, "_max_rows", lambda: 5)
+        # 现有 5 行（seed），再 insert 1 条即越限
+        r = t["customer_dataset_write_batch"](
+            dataset_key=src,
+            ops=[{"op": "insert", "values": {"id": 99, "region": "x", "amount": 1.0}}],
+        )
+        assert "error" in r and "超过上限" in r["error"]
+        total = t["customer_dataset_query"](dataset_key=src, count_only=True)
+        assert total["count"] == 5  # 零变更
