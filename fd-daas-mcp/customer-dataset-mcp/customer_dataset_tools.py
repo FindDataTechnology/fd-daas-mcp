@@ -336,6 +336,10 @@ class IndicatorGatewayError(CustomerDatasetError):
 JOIN_MAX_CODES = 10
 JOIN_MAX_REGIONS = 64
 
+#: 实体镜像 domain_unavailable 时的规范名回退（v1：仅中国；值经产线
+#: read_range(country/1) 实证可读）
+_CANONICAL_ENTITIES: dict[str, tuple[str, int]] = {"中国": ("country", 1)}
+
 
 def _join_date_periods(value: Any) -> tuple[str, str, str]:
     """A row date → (exact 'YYYY-MM-DD', month 'YYYY-MM', year 'YYYY').
@@ -403,11 +407,19 @@ class _EntranceGateway:
         return {c: by_code[c] for c in codes}
 
     def resolve_entity(self, name: str) -> Optional[tuple[str, int]]:
-        """region name → (entity_type, entity_id); None when unresolvable."""
+        """region name → (entity_type, entity_id); None when unresolvable.
+
+        实体镜像（daas_search_entities 的数据面）在部分画像下是
+        domain_unavailable 的合法态（business-mcp 工具文档明示）——此时
+        回退到规范名表（v1：中国 → country/1，PMI 等国家线实测可读）；
+        其余名字如实返回 None（join 该行填 null 并入 unresolved_regions）。
+        """
         out = self._call("daas_search_entities", {"keyword": name, "limit": 1})
+        if isinstance(out, dict) and out.get("status") == "domain_unavailable":
+            return _CANONICAL_ENTITIES.get(str(name))
         results = out.get("results") if isinstance(out, dict) else None
         if not results:
-            return None
+            return _CANONICAL_ENTITIES.get(str(name))
         first = results[0]
         return str(first.get("entity_type", "")), int(first.get("id"))
 

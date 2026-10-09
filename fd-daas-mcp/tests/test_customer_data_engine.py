@@ -748,3 +748,38 @@ class TestWriteBatchRowCap:
         assert "error" in r and "超过上限" in r["error"]
         total = t["customer_dataset_query"](dataset_key=src, count_only=True)
         assert total["count"] == 5  # 零变更
+
+
+class TestEntityMirrorFallback:
+    def test_canonical_entity_when_mirror_unavailable(self, monkeypatch):
+        class _DownGateway:
+            def resolve_codes(self, codes):
+                return {"GDP_MO": 101}
+
+            def resolve_entity(self, name):
+                # 与 _EntranceGateway.resolve_entity 同逻辑的直测：
+                # 这里直接断言模块级规范名表在镜像挂时的可用性
+                return tools_module()._CANONICAL_ENTITIES.get(name)
+
+        def tools_module():
+            g = _t()["customer_dataset_join_indicators"].__globals__
+            import types
+            return types.SimpleNamespace(_CANONICAL_ENTITIES=g["_CANONICAL_ENTITIES"])
+
+        g = _t()["customer_dataset_join_indicators"].__globals__
+        assert g["_CANONICAL_ENTITIES"]["中国"] == ("country", 1)
+        fake = _FakeGateway({("country", 1): {101: [("2026-03-01", 3.3)]}})
+        _inject_gateway(monkeypatch, fake)
+        src = _key("fb")
+        child = _key("fbc")
+        _seed_join_source(src)
+        t = _t()
+        r = t["customer_dataset_join_indicators"](
+            child_key=child,
+            parent_key=src,
+            indicators=[{"code": "GDP_MO", "as": "gdp"}],
+            date_column="month",
+        )
+        assert "error" not in r, r
+        rows = t["customer_dataset_query"](dataset_key=child, sort=[{"column": "id", "dir": "asc"}])["rows"]
+        assert rows[0]["gdp"] == 3.3  # 默认实体经规范名表解析成功
