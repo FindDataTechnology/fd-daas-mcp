@@ -31,6 +31,7 @@ import sqlite3
 
 import pytest
 
+from conftest import engine_db_url, reset_pg_schema
 from daas.fd_daas_mcp import registry
 
 COLS = [
@@ -50,8 +51,11 @@ _ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
 @pytest.fixture(autouse=True)
 def _fresh_engine_db(tmp_path, monkeypatch):
-    """Per-test engine database under tmp_path (see module docstring)."""
-    monkeypatch.setenv("DAAS_DATABASE_URL", f"sqlite:///{tmp_path}/wal_engine.db")
+    """Per-test engine database under tmp_path (see module docstring). On the
+    postgres leg: the shared one-shot PG test database with the schema dropped
+    and recreated — the isolation equivalent of a fresh sqlite file."""
+    monkeypatch.setenv("DAAS_DATABASE_URL", engine_db_url(f"{tmp_path}/wal_engine.db"))
+    reset_pg_schema()
     yield
 
 

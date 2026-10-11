@@ -31,6 +31,8 @@ import sqlite3
 
 import pytest
 
+import conftest
+from conftest import engine_db_url, reset_pg_schema
 from daas.fd_daas_mcp import registry
 
 COLS = [
@@ -48,8 +50,11 @@ ROWS = [
 
 @pytest.fixture(autouse=True)
 def _fresh_engine_db(tmp_path, monkeypatch):
-    """Per-test engine database under tmp_path (see module docstring)."""
-    monkeypatch.setenv("DAAS_DATABASE_URL", f"sqlite:///{tmp_path}/incr_engine.db")
+    """Per-test engine database under tmp_path (see module docstring). On the
+    postgres leg: the shared one-shot PG test database with the schema dropped
+    and recreated — the isolation equivalent of a fresh sqlite file."""
+    monkeypatch.setenv("DAAS_DATABASE_URL", engine_db_url(f"{tmp_path}/incr_engine.db"))
+    reset_pg_schema()
     yield
 
 
@@ -322,29 +327,57 @@ def test_merge_first_commit_without_base_builds_baseline():
 def test_legacy_database_upgrades_lazily_and_replace_stays_replace(tmp_path, monkeypatch):
     # a database built by a pre-mode engine build: the ingests audit table
     # exists WITHOUT the mode column and already carries history rows
-    db_path = tmp_path / "legacy_engine.db"
-    con = sqlite3.connect(db_path)
-    con.execute(
-        "CREATE TABLE customer_dataset_ingests ("
-        " id VARCHAR(36) NOT NULL,"
-        " dataset_key VARCHAR(64) NOT NULL,"
-        " status VARCHAR(16) NOT NULL,"
-        " row_count INTEGER,"
-        " actor VARCHAR(255) NOT NULL,"
-        " started_at DATETIME,"
-        " finished_at DATETIME,"
-        " error TEXT,"
-        " PRIMARY KEY (id))"
-    )
-    con.execute(
-        "INSERT INTO customer_dataset_ingests"
-        " (id, dataset_key, status, row_count, actor, started_at)"
-        " VALUES ('legacy-row-1', 'legacy_hist', 'committed', 5, 'old-runner',"
-        " '2025-12-01 00:00:00.000000')"
-    )
-    con.commit()
-    con.close()
-    monkeypatch.setenv("DAAS_DATABASE_URL", f"sqlite:///{db_path}")
+    if conftest.TEST_BACKEND == "postgres":
+        # same legacy shape, materialized on the PG test database: drop the
+        # ORM-built table and recreate the pre-mode one, history row included
+        conftest.reset_pg_schema()
+        from sqlalchemy import create_engine, text
+
+        eng = create_engine(conftest.PG_TEST_URL)
+        with eng.begin() as con:
+            for stmt in (
+                "CREATE TABLE customer_dataset_ingests ("
+                " id VARCHAR(36) NOT NULL,"
+                " dataset_key VARCHAR(64) NOT NULL,"
+                " status VARCHAR(16) NOT NULL,"
+                " row_count INTEGER,"
+                " actor VARCHAR(255) NOT NULL,"
+                " started_at TIMESTAMP,"
+                " finished_at TIMESTAMP,"
+                " error TEXT,"
+                " PRIMARY KEY (id))",
+                "INSERT INTO customer_dataset_ingests"
+                " (id, dataset_key, status, row_count, actor, started_at)"
+                " VALUES ('legacy-row-1', 'legacy_hist', 'committed', 5, 'old-runner',"
+                " '2025-12-01 00:00:00.000000')",
+            ):
+                con.execute(text(stmt))
+        eng.dispose()
+        monkeypatch.setenv("DAAS_DATABASE_URL", conftest.PG_TEST_URL)
+    else:
+        db_path = tmp_path / "legacy_engine.db"
+        con = sqlite3.connect(db_path)
+        con.execute(
+            "CREATE TABLE customer_dataset_ingests ("
+            " id VARCHAR(36) NOT NULL,"
+            " dataset_key VARCHAR(64) NOT NULL,"
+            " status VARCHAR(16) NOT NULL,"
+            " row_count INTEGER,"
+            " actor VARCHAR(255) NOT NULL,"
+            " started_at DATETIME,"
+            " finished_at DATETIME,"
+            " error TEXT,"
+            " PRIMARY KEY (id))"
+        )
+        con.execute(
+            "INSERT INTO customer_dataset_ingests"
+            " (id, dataset_key, status, row_count, actor, started_at)"
+            " VALUES ('legacy-row-1', 'legacy_hist', 'committed', 5, 'old-runner',"
+            " '2025-12-01 00:00:00.000000')"
+        )
+        con.commit()
+        con.close()
+        monkeypatch.setenv("DAAS_DATABASE_URL", f"sqlite:///{db_path}")
 
     t = _t()
     # begin defaults to replace; the lazy ALTER lands inside the begin tx

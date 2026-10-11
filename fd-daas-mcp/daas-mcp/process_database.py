@@ -191,17 +191,15 @@ class ProcessDatabase:
     # ── source-table discovery (scraw_<slug>) ───────────────────
 
     def table_exists(self, name: str) -> bool:
+        # dialect-portable (sqlite master catalog / PG information_schema) —
+        # wire-cell-postgres-storage: the indicator chain must run on both.
         with self.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:n"),
-                {"n": name},
-            ).fetchone()
-            return row is not None
+            return inspect(conn).has_table(name)
 
     def column_exists(self, table: str, column: str) -> bool:
         validate_identifier(table)
         with self.engine.connect() as conn:
-            cols = [r[1] for r in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+            cols = [c["name"] for c in inspect(conn).get_columns(table)]
         return column in cols
 
     def list_source_tables(self) -> list[dict]:

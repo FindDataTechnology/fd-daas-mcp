@@ -67,6 +67,8 @@ if str(_DAAS_MCP_DIR) not in sys.path:
 from daas_database import get_database  # noqa: E402
 from models import CustomerDataset, CustomerDatasetCorrection, CustomerDatasetIngest  # noqa: E402
 
+import db_dialect  # noqa: E402  — backend adapter (sqlite passthrough / PG translation)
+
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _COL_RE = re.compile(r'^[^\x00-\x1f"]{1,64}$')
 _ENGINE_TYPES = {"INTEGER", "REAL", "TEXT"}
@@ -138,12 +140,37 @@ def _quote(ident: str) -> str:
     return '"' + ident.replace('"', '""') + '"'
 
 
-def _coerce(value: Any) -> Any:
-    """Normalize a cell value for sqlite3 (bools → int, containers → JSON)."""
+def _coerce(value: Any, ctype: Optional[str] = None) -> Any:
+    """Normalize a cell value for binding (bools → int, containers → JSON).
+
+    With a declared column type (INTEGER/REAL/TEXT) the value is additionally
+    normalized to the strict Python type that column stores — mirroring what
+    sqlite's column affinity does at rest, so the PostgreSQL leg (strict
+    typing, no affinity) lands on identical stored values: TEXT takes numbers
+    as their sqlite text form, REAL takes ints as floats, INTEGER takes whole
+    floats as ints (lossy floats stay float, exactly like sqlite affinity).
+    ``None`` passes through; the row hash is computed over the raw row, so
+    this never shifts the hash口径."""
     if isinstance(value, bool):
-        return int(value)
+        value = int(value)
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    if ctype is None or value is None:
+        return value
+    if ctype == "TEXT":
+        if isinstance(value, (int, float)):
+            # sqlite stores numeric input into a TEXT-affinity column as text;
+            # str() of a Python int/float produces that same text form.
+            return str(value)
+        return value
+    if ctype == "REAL":
+        if isinstance(value, int):
+            return float(value)
+        return value
+    if ctype == "INTEGER":
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
     return value
 
 
@@ -153,6 +180,15 @@ def _norm(value: Any) -> Any:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value
+
+
+def _json_col(value: Any) -> Any:
+    """Read a JSON-typed ORM column through a RAW select: sqlite hands back the
+    stored text (parse it — the legacy behavior), PostgreSQL hands back the
+    already-deserialized object (pass through). None passes through."""
+    if value is None or not isinstance(value, (str, bytes, bytearray)):
+        return value
+    return json.loads(value)
 
 
 def _row_hash(columns: list[str], row: dict) -> str:
@@ -166,16 +202,6 @@ def _row_hash(columns: list[str], row: dict) -> str:
 
 
 # ── provenance WAL (wire-provenance-ledger D3: same-transaction collection) ──
-
-_WAL_TABLE_SQL = (
-    "CREATE TABLE IF NOT EXISTS cell_event_wal ("
-    " seq INTEGER PRIMARY KEY AUTOINCREMENT,"
-    " event_id TEXT NOT NULL UNIQUE,"
-    " type TEXT NOT NULL,"
-    " payload TEXT NOT NULL,"
-    " created_at TEXT NOT NULL,"
-    " acked INTEGER NOT NULL DEFAULT 0)"
-)
 
 
 def _now_wal() -> str:
@@ -191,8 +217,9 @@ def _wal_append(cur, type: str, payload: dict) -> None:
     together. Lazy table creation follows the group's existing pattern
     (staging tables are CREATE TABLE'd inside ``_tx()`` too); IF NOT EXISTS
     makes every call idempotent and old databases upgrade on first event.
+    (The DDL comes from db_dialect: sqlite AUTOINCREMENT / PG identity column.)
     """
-    cur.execute(_WAL_TABLE_SQL)
+    cur.execute(db_dialect.wal_table_sql())
     cur.execute(
         "INSERT INTO cell_event_wal (event_id, type, payload, created_at)"
         " VALUES (?, ?, ?, ?)",
@@ -207,16 +234,16 @@ def _wal_append(cur, type: str, payload: dict) -> None:
 
 def _wal_table_exists(cur) -> bool:
     """True once the WAL table has been created (old DBs before any event)."""
-    return (
-        cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='cell_event_wal'"
-        ).fetchone()
-        is not None
-    )
+    sql, params = db_dialect.table_exists_sql("cell_event_wal")
+    return cur.execute(sql, params).fetchone() is not None
 
 
-def _anchor_where(anchor: str, pk_columns: list[str]) -> tuple[str, list]:
-    """anchor → (WHERE sql fragment, params). Raises on unusable anchors."""
+def _anchor_where(
+    anchor: str, pk_columns: list[str], col_types: Optional[dict] = None
+) -> tuple[str, list]:
+    """anchor → (WHERE sql fragment, params). Raises on unusable anchors.
+    ``col_types`` (declared name→type map) normalizes pk values to the strict
+    column type — the affinity-equivalent comparison sqlite applies for free."""
     if not isinstance(anchor, str) or not anchor:
         raise CustomerDatasetError("行锚不能为空")
     if anchor.startswith("pk:"):
@@ -229,7 +256,8 @@ def _anchor_where(anchor: str, pk_columns: list[str]) -> tuple[str, list]:
         if not isinstance(vals, list) or len(vals) != len(pk_columns):
             raise CustomerDatasetError(f"pk 行锚与主键列数不匹配: {anchor!r}")
         where = " AND ".join(f"{_quote(p)} = ?" for p in pk_columns)
-        return where, list(vals)
+        types = col_types or {}
+        return where, [_coerce(v, types.get(p)) for v, p in zip(vals, pk_columns)]
     if anchor.startswith("hash:"):
         return f'{_quote("__row_hash")} = ?', [anchor[5:]]
     if anchor.startswith("ins:"):
@@ -238,9 +266,13 @@ def _anchor_where(anchor: str, pk_columns: list[str]) -> tuple[str, list]:
     raise CustomerDatasetError(f"未知行锚形态: {anchor!r}（应为 pk:… / hash:… / ins:…）")
 
 
-def _build_where(filters: Optional[list], columns: list[str]) -> tuple[str, list]:
+def _build_where(
+    filters: Optional[list], columns: list[str], col_types: Optional[dict] = None
+) -> tuple[str, list]:
     """filters → (WHERE sql fragment, params). AND composition only (v1);
-    every operator is whitelisted and every value parameterized."""
+    every operator is whitelisted and every value parameterized.
+    ``col_types`` normalizes values to the declared column type (see _coerce)."""
+    types = col_types or {}
     clauses: list[str] = []
     params: list = []
     for f in filters or []:
@@ -262,13 +294,13 @@ def _build_where(filters: Optional[list], columns: list[str]) -> tuple[str, list
             ph = ", ".join("?" for _ in vals)
             sql_op = "IN" if op == "in" else "NOT IN"
             clauses.append(f"{qcol} {sql_op} ({ph})")
-            params.extend(_coerce(v) for v in vals)
+            params.extend(_coerce(v, types.get(col)) for v in vals)
         elif op == "like":
-            clauses.append(f"{qcol} LIKE ?")
+            clauses.append(f"{qcol} {db_dialect.like_op()} ?")
             params.append(str(f.get("value")))
         else:
             clauses.append(f"{qcol} {_QUERY_OPS_SQL[op]} ?")
-            params.append(_coerce(f.get("value")))
+            params.append(_coerce(f.get("value"), types.get(col)))
     return (" AND ".join(clauses), params) if clauses else ("", [])
 
 
@@ -292,11 +324,22 @@ def _build_order(sort: Optional[list], columns: list[str]) -> str:
 def _raw_query_timed(
     sql: str, params: tuple | list = (), timeout: float = QUERY_TIMEOUT_S
 ) -> list[tuple]:
-    """Read with a progress-handler deadline: a query that runs past
-    ``timeout`` seconds aborts and surfaces as an honest domain error instead
-    of pinning the cell's single writer."""
+    """Read with a deadline guard: a query that runs past ``timeout`` seconds
+    aborts and surfaces as an honest domain error instead of pinning the
+    cell's single writer. sqlite implements the deadline with a progress
+    handler; PostgreSQL with a per-statement ``statement_timeout`` (both map
+    to the same domain error text)."""
     conn = get_database().engine.raw_connection()
     try:
+        if db_dialect.is_postgres():
+            try:
+                return db_dialect.pg_query_timed(conn, sql, params, float(timeout))
+            except Exception as exc:  # noqa: BLE001 — driver-native failures
+                if db_dialect.is_timeout_error(exc):
+                    raise CustomerDatasetError(
+                        f"查询超时（>{float(timeout):.0f}s），请收窄过滤条件或减少数据量"
+                    ) from exc
+                raise
         deadline = time.monotonic() + float(timeout)
         timed_out = False
 
@@ -319,7 +362,8 @@ def _raw_query_timed(
                 ) from exc
             raise
     finally:
-        conn.set_progress_handler(None, 0)
+        if not db_dialect.is_postgres():
+            conn.set_progress_handler(None, 0)
         conn.close()
 
 
@@ -490,26 +534,40 @@ def _join_series_index(points: list[dict]) -> dict[str, Any]:
 
 @contextmanager
 def _tx():
-    """Explicit BEGIN IMMEDIATE … COMMIT around one raw sqlite connection.
+    """Explicit BEGIN IMMEDIATE … COMMIT around one raw connection.
 
     The sqlite3 module only auto-begins transactions for DML, not DDL — the
     commit path mixes both (RENAME/CREATE + INSERT), so the transaction is
-    managed by hand to keep the snapshot swap atomic.
+    managed by hand to keep the snapshot swap atomic. PostgreSQL: psycopg
+    opens a plain transaction at the first statement and commit/rollback
+    close it — same atomicity, no isolation attribute is touched.
     """
     conn = get_database().engine.raw_connection()
     try:
-        conn.isolation_level = None
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        try:
-            yield cur
-        except BaseException:
+        if db_dialect.is_postgres():
+            cur = db_dialect.wrap_cursor(conn.cursor())
             try:
-                cur.execute("ROLLBACK")
-            except Exception:  # noqa: BLE001 - rollback best effort
-                pass
-            raise
-        cur.execute("COMMIT")
+                yield cur
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001 - rollback best effort
+                    pass
+                raise
+            conn.commit()
+        else:
+            conn.isolation_level = None
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                yield cur
+            except BaseException:
+                try:
+                    cur.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001 - rollback best effort
+                    pass
+                raise
+            cur.execute("COMMIT")
     finally:
         conn.close()
 
@@ -517,7 +575,7 @@ def _tx():
 def _raw_query_one(sql: str, params: tuple = ()) -> Optional[tuple]:
     conn = get_database().engine.raw_connection()
     try:
-        cur = conn.cursor()
+        cur = db_dialect.wrap_cursor(conn.cursor())
         cur.execute(sql, params)
         return cur.fetchone()
     finally:
@@ -527,7 +585,7 @@ def _raw_query_one(sql: str, params: tuple = ()) -> Optional[tuple]:
 def _raw_query_all(sql: str, params: tuple = ()) -> list[tuple]:
     conn = get_database().engine.raw_connection()
     try:
-        cur = conn.cursor()
+        cur = db_dialect.wrap_cursor(conn.cursor())
         cur.execute(sql, params)
         return cur.fetchall()
     finally:
@@ -567,18 +625,22 @@ def _table_name(dataset_key: str, suffix: str = "") -> str:
     return f"cust_{dataset_key}{suffix}"
 
 
-def _meta_raw(cur, dataset_key: str) -> Optional[tuple[list, list, Optional[str]]]:
-    """(columns, pk_columns, name) straight from the metadata table, read on the
-    caller's own connection (safe inside an open write transaction)."""
+def _meta_raw(cur, dataset_key: str) -> Optional[tuple[list, list, Optional[str], dict]]:
+    """(columns, pk_columns, name, col_types) straight from the metadata table,
+    read on the caller's own connection (safe inside an open write
+    transaction). ``col_types`` maps column name → declared type for strict
+    value coercion (see ``_coerce``)."""
     row = cur.execute(
         "SELECT columns_json, pk_columns_json, name FROM customer_datasets WHERE key=?",
         (dataset_key,),
     ).fetchone()
     if row is None:
         return None
-    columns = [c["name"] for c in (json.loads(row[0]) if row[0] else [])]
-    pk_columns = list(json.loads(row[1])) if row[1] else []
-    return columns, pk_columns, row[2]
+    declared = _json_col(row[0]) or []
+    columns = [c["name"] for c in declared]
+    pk_columns = list(_json_col(row[1])) if row[1] else []
+    col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in declared}
+    return columns, pk_columns, row[2], col_types
 
 
 def _ensure_ingest_mode_column(cur) -> None:
@@ -653,7 +715,9 @@ class CustomerDatasetService:
                 (now, dataset_key),
             )
             cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
-            col_defs = ", ".join(f"{_quote(c['name'])} {c['type']}" for c in columns)
+            col_defs = ", ".join(
+                f"{_quote(c['name'])} {db_dialect.column_type_sql(c['type'])}" for c in columns
+            )
             cur.execute(
                 f'CREATE TABLE {_quote(staging)} ({col_defs}, {_quote("__row_hash")} TEXT NOT NULL)'
             )
@@ -699,7 +763,7 @@ class CustomerDatasetService:
             meta = _meta_raw(cur, dataset_key)
             if meta is None:
                 raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
-            col_names = meta[0]
+            col_names, col_types = meta[0], meta[3]
             staging = _table_name(dataset_key, "__staging")
             stored = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
             if int(start_index) != stored:
@@ -708,7 +772,7 @@ class CustomerDatasetService:
             for row in rows:
                 if not isinstance(row, dict):
                     raise CustomerDatasetError("rows 中的元素必须是对象")
-                vals = [_coerce(row.get(c)) for c in col_names]
+                vals = [_coerce(row.get(c), col_types.get(c)) for c in col_names]
                 inserts.append(tuple(vals) + (_row_hash(col_names, row),))
             collist = ", ".join(_quote(c) for c in col_names + ["__row_hash"])
             placeholders = ", ".join("?" for _ in col_names + ["__row_hash"])
@@ -744,7 +808,7 @@ class CustomerDatasetService:
                 meta = _meta_raw(cur, dataset_key)
                 if meta is None:
                     raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
-                columns, pk_columns, _name = meta
+                columns, pk_columns, _name, _types = meta
                 incoming = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
                 total = self._merge_staging_into_base(
                     cur, staging, base, effective, columns, pk_columns
@@ -765,7 +829,7 @@ class CustomerDatasetService:
                 meta = _meta_raw(cur, dataset_key)
                 if meta is None:
                     raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
-                columns, pk_columns, _name = meta
+                columns, pk_columns, _name, _types = meta
 
                 # atomic swap: staging → base, then rebuild the effective table
                 cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
@@ -779,7 +843,7 @@ class CustomerDatasetService:
                 )
 
             replayed, _dangling_now = self._replay_corrections(
-                cur, dataset_key, effective, columns, pk_columns
+                cur, dataset_key, effective, columns, pk_columns, col_types=_types
             )
             size_bytes = self._size_of(cur, effective)
             now = _now_db()
@@ -833,12 +897,8 @@ class CustomerDatasetService:
             raise CustomerDatasetError(
                 f"merge 拒收：staging 有 {nulls} 行主键为 NULL（整批拒绝，base 未动）"
             )
-        has_base = (
-            cur.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (base,)
-            ).fetchone()
-            is not None
-        )
+        exists_sql, exists_params = db_dialect.table_exists_sql(base)
+        has_base = cur.execute(exists_sql, exists_params).fetchone() is not None
         if not has_base:
             # first-ever commit for the key — nothing to merge into, so the
             # incremental window degenerates to the plain snapshot swap
@@ -906,11 +966,18 @@ class CustomerDatasetService:
         return int(cur.execute(f"SELECT COALESCE(SUM({expr}), 0) FROM {_quote(table)}").fetchone()[0])
 
     def _replay_corrections(
-        self, cur, dataset_key: str, effective: str, columns: list[str], pk_columns: list[str]
+        self,
+        cur,
+        dataset_key: str,
+        effective: str,
+        columns: list[str],
+        pk_columns: list[str],
+        col_types: Optional[dict] = None,
     ) -> tuple[int, int]:
         """Replay every active correction onto the rebuilt effective table.
         Returns (applied, dangling-after). Successfully replayed corrections
         get their dangling mark cleared."""
+        types = col_types or {}
         rows = cur.execute(
             "SELECT id, op, anchor, values_json FROM customer_dataset_corrections"
             " WHERE dataset_key=? AND reverted_at IS NULL ORDER BY id",
@@ -919,7 +986,7 @@ class CustomerDatasetService:
         applied = 0
         dangling = 0
         for cid, op, anchor, values_json in rows:
-            vals = json.loads(values_json) if values_json else {}
+            vals = _json_col(values_json) if values_json else {}
             matched = 0
             reason: Optional[str] = None
             if op == "insert":
@@ -931,13 +998,13 @@ class CustomerDatasetService:
                     placeholders = ", ".join("?" for _ in cols + ["__row_hash"])
                     cur.execute(
                         f"INSERT INTO {_quote(effective)} ({collist}) VALUES ({placeholders})",
-                        [_coerce(vals[c]) for c in cols] + [anchor],
+                        [_coerce(vals[c], types.get(c)) for c in cols] + [anchor],
                     )
                     matched = 1
             else:
                 where = params = None
                 try:
-                    where, params = _anchor_where(anchor, pk_columns)
+                    where, params = _anchor_where(anchor, pk_columns, types)
                 except CustomerDatasetError as exc:
                     reason = str(exc)
                 if where is not None:
@@ -949,7 +1016,7 @@ class CustomerDatasetService:
                             sets = ", ".join(f"{_quote(c)} = ?" for c in set_cols)
                             cur.execute(
                                 f"UPDATE {_quote(effective)} SET {sets} WHERE {where}",
-                                [_coerce(vals[c]) for c in set_cols] + list(params),
+                                [_coerce(vals[c], types.get(c)) for c in set_cols] + list(params),
                             )
                             matched = cur.rowcount
                     else:  # delete
@@ -988,9 +1055,9 @@ class CustomerDatasetService:
         now = _now_db()
         cur.execute(
             "INSERT INTO sources (name, label, description, enabled, config, created_at, updated_at)"
-            " VALUES (?, ?, ?, 1, ?, ?, ?)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(name) DO UPDATE SET description=excluded.description, updated_at=excluded.updated_at",
-            (name, dataset_key, "客户数据集（wire-customer-local-data）", json.dumps({"kind": "customer_dataset"}), now, now),
+            (name, dataset_key, "客户数据集（wire-customer-local-data）", True, json.dumps({"kind": "customer_dataset"}), now, now),
         )
         cur.execute(
             "INSERT INTO datasources (name, db_type, connection_string, description, is_readonly, created_at, updated_at)"
@@ -1051,8 +1118,9 @@ class CustomerDatasetService:
         meta = self._meta(dataset_key)
         columns = [c["name"] for c in (meta.columns_json or [])]
         pk_columns = list(meta.pk_columns_json or [])
+        col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in (meta.columns_json or [])}
         table = _table_name(dataset_key, "__base" if raw else "")
-        where, params = _build_where(filters, columns)
+        where, params = _build_where(filters, columns, col_types)
         where_sql = f" WHERE {where}" if where else ""
 
         if distinct_column is not None:
@@ -1151,11 +1219,11 @@ class CustomerDatasetService:
                 raise CustomerDatasetError(f"聚合列不存在: {col!r}")
             if func in ("sum", "avg") and col_types.get(col) == "TEXT":
                 raise CustomerDatasetError(f"{func} 不支持 TEXT 列: {col!r}")
-            exprs.append(f"{func.upper()}({_quote(col)})")
+            exprs.append(db_dialect.agg_expr(func, _quote(col)))
             keys.append(f"{func}__{col}")
 
         table = _table_name(dataset_key, "__base" if raw else "")
-        where, params = _build_where(filters, list(col_types))
+        where, params = _build_where(filters, list(col_types), col_types)
         where_sql = f" WHERE {where}" if where else ""
         group_sql = ", ".join(_quote(g) for g in group_by)
         measure_sql = ", ".join(exprs)
@@ -1219,6 +1287,7 @@ class CustomerDatasetService:
         actor_id: Optional[str],
         actor_label: Optional[str],
         strict_anchors: bool,
+        col_types: Optional[dict] = None,
     ) -> int:
         """Apply + record ONE overlay edit ON THE CALLER'S OPEN TRANSACTION
         CURSOR — shared by ``correction_add`` (single) and ``write_batch``
@@ -1231,10 +1300,11 @@ class CustomerDatasetService:
         Returns the minted correction id."""
         if channel not in _CHANNELS:
             raise CustomerDatasetError(f"非法写入通道: {channel!r}（允许 {sorted(_CHANNELS)}）")
+        types = col_types or {}
         effective = _table_name(dataset_key)
         now = _now_db()
         if op == "update":
-            where, params = _anchor_where(anchor, pk_columns)
+            where, params = _anchor_where(anchor, pk_columns, types)
             cur.execute(f"SELECT * FROM {_quote(effective)} WHERE {where} LIMIT 1", params)
             old = cur.fetchone()
             old_values = None
@@ -1244,7 +1314,7 @@ class CustomerDatasetService:
             sets = ", ".join(f"{_quote(c)} = ?" for c in values)
             cur.execute(
                 f"UPDATE {_quote(effective)} SET {sets} WHERE {where}",
-                [_coerce(values[c]) for c in values] + list(params),
+                [_coerce(values[c], types.get(c)) for c in values] + list(params),
             )
             matched = cur.rowcount
             if strict_anchors and not matched:
@@ -1270,7 +1340,7 @@ class CustomerDatasetService:
             )
             correction_id = cur.lastrowid
         elif op == "delete":
-            where, params = _anchor_where(anchor, pk_columns)
+            where, params = _anchor_where(anchor, pk_columns, types)
             cur.execute(f"DELETE FROM {_quote(effective)} WHERE {where}", params)
             matched = cur.rowcount
             if strict_anchors and not matched:
@@ -1318,7 +1388,7 @@ class CustomerDatasetService:
             placeholders = ", ".join("?" for _ in values) + ", ?"
             cur.execute(
                 f"INSERT INTO {_quote(effective)} ({collist}) VALUES ({placeholders})",
-                [_coerce(values[c]) for c in values] + [anchor],
+                [_coerce(values[c], types.get(c)) for c in values] + [anchor],
             )
         # provenance: correction recorded + applied — same transaction.
         # (For inserts `anchor` is the minted ins:<correction_id> by now.)
@@ -1351,12 +1421,13 @@ class CustomerDatasetService:
         meta = self._meta(dataset_key)
         columns = [c["name"] for c in (meta.columns_json or [])]
         pk_columns = list(meta.pk_columns_json or [])
+        col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in (meta.columns_json or [])}
         op, values = self._validate_edit_op(op, anchor, values, columns)
         with _tx() as cur:
             correction_id = self._correction_apply_tx(
                 cur, dataset_key, columns, pk_columns, op, anchor, values,
                 actor=actor, channel=channel, actor_id=actor_id, actor_label=actor_label,
-                strict_anchors=False,
+                strict_anchors=False, col_types=col_types,
             )
         self._session.expire_all()
         return {"correction_id": correction_id}
@@ -1382,6 +1453,7 @@ class CustomerDatasetService:
         meta = self._meta(dataset_key)
         columns = [c["name"] for c in (meta.columns_json or [])]
         pk_columns = list(meta.pk_columns_json or [])
+        col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in (meta.columns_json or [])}
         checked: list[tuple[str, Optional[str], dict]] = []
         inserts = 0
         for i, entry in enumerate(ops):
@@ -1413,7 +1485,7 @@ class CustomerDatasetService:
                         self._correction_apply_tx(
                             cur, dataset_key, columns, pk_columns, op, anchor, values,
                             actor=actor, channel=channel, actor_id=actor_id,
-                            actor_label=actor_label, strict_anchors=True,
+                            actor_label=actor_label, strict_anchors=True, col_types=col_types,
                         )
                     )
                 except CustomerDatasetError as exc:
@@ -1476,13 +1548,15 @@ class CustomerDatasetService:
                 "dataset.correction.reverted",
                 {"dataset_key": dataset_key, "correction_id": int(correction_id), "actor": actor},
             )
-            exists = cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (base,)
-            ).fetchone()
+            exists_sql, exists_params = db_dialect.table_exists_sql(base)
+            exists = cur.execute(exists_sql, exists_params).fetchone()
             if exists is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
                 cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
-                self._replay_corrections(cur, dataset_key, effective, columns, pk_columns)
+                self._replay_corrections(
+                    cur, dataset_key, effective, columns, pk_columns,
+                    col_types={c["name"]: str(c.get("type", "TEXT")).upper() for c in (meta.columns_json or [])},
+                )
                 size_bytes = self._size_of(cur, effective)
                 cur.execute(
                     "UPDATE customer_datasets SET size_bytes=?, updated_at=? WHERE key=?",
@@ -1623,15 +1697,18 @@ class CustomerDatasetService:
         base = _table_name(child_key, "__base")
         effective = _table_name(child_key)
         cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
-        col_defs = ", ".join(f"{_quote(c['name'])} {c['type']}" for c in columns)
+        col_defs = ", ".join(
+            f"{_quote(c['name'])} {db_dialect.column_type_sql(c['type'])}" for c in columns
+        )
         cur.execute(f"CREATE TABLE {_quote(staging)} ({col_defs}, {_quote('__row_hash')} TEXT NOT NULL)")
         col_names = [c["name"] for c in columns]
+        col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in columns}
         collist = ", ".join(_quote(c) for c in col_names + ["__row_hash"])
         placeholders = ", ".join("?" for _ in col_names + ["__row_hash"])
         cur.executemany(
             f"INSERT INTO {_quote(staging)} ({collist}) VALUES ({placeholders})",
             [
-                tuple(_coerce(r.get(c)) for c in col_names) + (_row_hash(col_names, r),)
+                tuple(_coerce(r.get(c), col_types.get(c)) for c in col_names) + (_row_hash(col_names, r),)
                 for r in rows
             ],
         )
@@ -1689,10 +1766,11 @@ class CustomerDatasetService:
         ).fetchone()
         if row is None:
             raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
-        columns = json.loads(row[0]) if row[0] else []
-        pk_columns = list(json.loads(row[1])) if row[1] else []
+        columns = _json_col(row[0]) or []
+        pk_columns = list(_json_col(row[1])) if row[1] else []
         names = [c["name"] for c in columns]
-        where, params = _build_where(filters, names)
+        types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in columns}
+        where, params = _build_where(filters, names, types)
         order_sql = _build_order(sort, names)
         limit_sql = f" LIMIT {max(1, int(limit))}" if limit else ""
         collist = ", ".join(_quote(c) for c in names)
@@ -1785,6 +1863,7 @@ class CustomerDatasetService:
         # parent sanity + distinct regions + date span (read-only, no tx)
         meta = self._meta(parent_key)
         names = [c["name"] for c in (meta.columns_json or [])]
+        col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in (meta.columns_json or [])}
         if date_column not in names:
             raise CustomerDatasetError(f"日期列不存在: {date_column!r}")
         if region_column is not None and region_column not in names:
@@ -1792,7 +1871,7 @@ class CustomerDatasetService:
         for e in entries:
             if e["alias"] in names:
                 raise CustomerDatasetError(f"输出列名与源列冲突: {e['alias']!r}")
-        where, params = _build_where(filters, names)
+        where, params = _build_where(filters, names, col_types)
         where_sql = f" WHERE {where}" if where else ""
         src = _table_name(parent_key)
         span = _raw_query_one(
@@ -1897,6 +1976,8 @@ class CustomerDatasetService:
         right_plan: list[tuple[str, str]],
         spec: dict,
         actor: str,
+        left_join_type: str = "TEXT",
+        right_join_type: str = "TEXT",
     ) -> int:
         """CREATE-AS variant of ``_materialize_child_tx`` (wire-entity-link
         D1): the join runs entirely SQL-side (no Python row materialization),
@@ -1904,38 +1985,71 @@ class CustomerDatasetService:
         hashes come from a per-connection scalar function computing the exact
         ``_row_hash`` canonical form. Oversize results reject the whole
         transaction; the child keeps its previous state. ``derive``'s original
-        path is untouched."""
+        path is untouched.
+
+        PostgreSQL has no per-connection Python scalar functions: there the
+        join SELECT still runs SQL-side (with the dialect's null-safe key
+        predicate), and the canonical hash is computed Python-side over the
+        joined values — identical hashes, no ``create_function``."""
         limit = _max_rows()
         staging = _table_name(child_key, "__staging")
         base = _table_name(child_key, "__base")
         effective = _table_name(child_key)
         left_names = [c["name"] for c in columns[: len(columns) - len(right_plan)]]
         out_names = [c["name"] for c in columns]
-        cur.connection.create_function(
-            "__cust_row_hash",
-            len(out_names),
-            lambda *values: _row_hash(out_names, dict(zip(out_names, values))),
-        )
         right_sel = ", ".join(f"r.{_quote(rn)} AS {_quote(out)}" for rn, out in right_plan)
-        hash_args = ", ".join(
-            [f"l.{_quote(n)}" for n in left_names]
-            + [f"r.{_quote(rn)}" for rn, _ in right_plan]
-        )
         # NOTE: the left columns are listed explicitly — ``l.*`` would drag the
         # left table's own ``__row_hash`` along (SQLite renames our aliased
         # hash to ``__row_hash:1`` and the stale left hash would win).
         left_sel = ", ".join(f"l.{_quote(n)}" for n in left_names)
-        cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
-        # IS (not =) keeps equality semantics consistent for NULL keys:
-        # NULL IS NULL matches, mirroring how business keys compare elsewhere.
-        cur.execute(
-            f"CREATE TABLE {_quote(staging)} AS "
-            f"SELECT {left_sel}, {right_sel}, "
-            f"__cust_row_hash({hash_args}) AS {_quote('__row_hash')} "
-            f"FROM {_quote(left_table)} AS l LEFT JOIN {_quote(right_table)} AS r "
-            f"ON l.{_quote(left_column)} IS r.{_quote(right_column)}"
+        # Null-safe key equality keeps NULL keys matching NULL (sqlite's bare
+        # IS / PG's IS NOT DISTINCT FROM), and the dialect predicate reproduces
+        # sqlite's cross-affinity key comparison (INTEGER 1 ≍ TEXT '1').
+        on_sql = db_dialect.join_key_predicate(
+            f"l.{_quote(left_column)}", left_join_type,
+            f"r.{_quote(right_column)}", right_join_type,
         )
-        total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
+        if db_dialect.is_postgres():
+            joined = cur.execute(
+                f"SELECT {left_sel}, {right_sel} "
+                f"FROM {_quote(left_table)} AS l LEFT JOIN {_quote(right_table)} AS r "
+                f"ON {on_sql}"
+            ).fetchall()
+            col_defs = ", ".join(
+                f"{_quote(c['name'])} {db_dialect.column_type_sql(c['type'])}" for c in columns
+            )
+            cur.execute(
+                f"CREATE TABLE {_quote(staging)} ({col_defs}, {_quote('__row_hash')} TEXT NOT NULL)"
+            )
+            collist = ", ".join(_quote(c) for c in out_names + ["__row_hash"])
+            placeholders = ", ".join("?" for _ in out_names + ["__row_hash"])
+            cur.executemany(
+                f"INSERT INTO {_quote(staging)} ({collist}) VALUES ({placeholders})",
+                [
+                    tuple(row) + (_row_hash(out_names, dict(zip(out_names, row))),)
+                    for row in joined
+                ],
+            )
+            total = len(joined)
+        else:
+            cur.connection.create_function(
+                "__cust_row_hash",
+                len(out_names),
+                lambda *values: _row_hash(out_names, dict(zip(out_names, values))),
+            )
+            hash_args = ", ".join(
+                [f"l.{_quote(n)}" for n in left_names]
+                + [f"r.{_quote(rn)}" for rn, _ in right_plan]
+            )
+            cur.execute(
+                f"CREATE TABLE {_quote(staging)} AS "
+                f"SELECT {left_sel}, {right_sel}, "
+                f"__cust_row_hash({hash_args}) AS {_quote('__row_hash')} "
+                f"FROM {_quote(left_table)} AS l LEFT JOIN {_quote(right_table)} AS r "
+                f"ON l.{_quote(left_column)} IS r.{_quote(right_column)}"
+            )
+            total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
         if total > limit:
             raise CustomerDatasetError(
                 f"连接行数 {total} 超过上限 {limit}（整批拒绝，子集保持原状）"
@@ -2028,8 +2142,8 @@ class CustomerDatasetService:
                 if row is None:
                     raise CustomerDatasetError(f"{side}数据集不存在: {key!r}")
                 meta_rows[side] = row
-            left_columns = json.loads(meta_rows["左"][0]) if meta_rows["左"][0] else []
-            right_columns = json.loads(meta_rows["右"][0]) if meta_rows["右"][0] else []
+            left_columns = _json_col(meta_rows["左"][0]) or []
+            right_columns = _json_col(meta_rows["右"][0]) or []
             left_names = [c["name"] for c in left_columns]
             right_names = [c["name"] for c in right_columns]
             if left_column not in left_names:
@@ -2057,7 +2171,13 @@ class CustomerDatasetService:
                 {"name": out, "type": rc["type"]} for rc, (_, out) in zip(right_columns, right_plan)
             ]
             out_columns = _validate_columns(out_columns)
-            pk_columns = list(json.loads(meta_rows["左"][1])) if meta_rows["左"][1] else []
+            pk_columns = list(_json_col(meta_rows["左"][1])) if meta_rows["左"][1] else []
+            left_join_type = str(
+                next((c.get("type", "TEXT") for c in left_columns if c["name"] == left_column), "TEXT")
+            ).upper()
+            right_join_type = str(
+                next((c.get("type", "TEXT") for c in right_columns if c["name"] == right_column), "TEXT")
+            ).upper()
             total = self._materialize_link_child_tx(
                 cur,
                 child_key,
@@ -2072,6 +2192,8 @@ class CustomerDatasetService:
                 right_plan,
                 spec,
                 actor,
+                left_join_type=left_join_type,
+                right_join_type=right_join_type,
             )
         self._session.expire_all()
         return {"dataset_key": child_key, "rows": total, "kind": "link"}
@@ -2088,7 +2210,7 @@ class CustomerDatasetService:
         if lin is None:
             raise CustomerDatasetError(f"不是派生数据集: {child_key!r}")
         parent_key, kind, spec_json = lin
-        spec = json.loads(spec_json) if spec_json else {}
+        spec = _json_col(spec_json) if spec_json else {}
         if kind == "link":
             result = self.link(
                 child_key,
@@ -2145,7 +2267,7 @@ class CustomerDatasetService:
                 {
                     "parent_key": r[1],
                     "kind": r[2],
-                    "spec": json.loads(r[3]) if r[3] else {},
+                    "spec": _json_col(r[3]) if r[3] else {},
                     "status": r[4],
                     "last_run_at": r[5],
                     "last_error": r[6],

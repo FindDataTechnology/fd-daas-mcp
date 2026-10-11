@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import pytest
 
+from conftest import dialect_cursor, engine_db_url, reset_pg_schema
 from daas.fd_daas_mcp import registry
 
 ORDER_COLS = [
@@ -53,8 +54,11 @@ CUSTOMERS = [
 
 @pytest.fixture(autouse=True)
 def _fresh_engine_db(tmp_path, monkeypatch):
-    """Per-test engine database under tmp_path (see module docstring)."""
-    monkeypatch.setenv("DAAS_DATABASE_URL", f"sqlite:///{tmp_path}/link_engine.db")
+    """Per-test engine database under tmp_path (see module docstring). On the
+    postgres leg: the shared one-shot PG test database with the schema dropped
+    and recreated — the isolation equivalent of a fresh sqlite file."""
+    monkeypatch.setenv("DAAS_DATABASE_URL", engine_db_url(f"{tmp_path}/link_engine.db"))
+    reset_pg_schema()
     yield
 
 
@@ -133,7 +137,7 @@ def test_link_materializes_left_join():
     # table's own __row_hash must NOT leak through the join)
     conn = _raw_conn()
     try:
-        phys = [r[1] for r in conn.cursor().execute("PRAGMA table_info(cust_lnk_child)")]
+        phys = [r[1] for r in dialect_cursor(conn).execute("PRAGMA table_info(cust_lnk_child)")]
     finally:
         conn.close()
     assert phys == ["id", "customer_id", "amount", "right_id", "name", "tier", "__row_hash"]
@@ -247,7 +251,7 @@ def test_over_cap_rejects_whole_batch(monkeypatch):
     assert "error" in t["customer_dataset_overview"](dataset_key="lnk_child")
     conn = _raw_conn()
     try:
-        cur = conn.cursor()
+        cur = dialect_cursor(conn)
         assert cur.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'cust_lnk_child%'"
         ).fetchone()[0] == 0

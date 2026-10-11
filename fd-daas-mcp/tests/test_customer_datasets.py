@@ -19,6 +19,7 @@ sys.path.insert(0, str(_DAAS_MCP))
 from daas_database import get_database  # noqa: E402
 sys.path.remove(str(_DAAS_MCP))
 
+from conftest import dialect_cursor  # noqa: E402
 from daas.fd_daas_mcp import registry  # noqa: E402
 
 COLS = [
@@ -106,14 +107,16 @@ def test_begin_supersedes_open_ingest_and_abort_keeps_snapshot():
     assert aborted == {"aborted": True}
     # old snapshot untouched, staging table dropped
     assert _t()["customer_dataset_preview"](dataset_key="sales_c")["total"] == 3
-    assert (
-        get_database()
-        .engine.raw_connection()
-        .cursor()
-        .execute("SELECT name FROM sqlite_master WHERE name='cust_sales_c__staging'")
-        .fetchone()
-        is None
-    )
+    _conn = get_database().engine.raw_connection()
+    try:
+        assert (
+            dialect_cursor(_conn)
+            .execute("SELECT name FROM sqlite_master WHERE name='cust_sales_c__staging'")
+            .fetchone()
+            is None
+        )
+    finally:
+        _conn.close()
 
 
 def test_chunk_start_index_guard():
@@ -258,7 +261,7 @@ def test_softref_metadata_rows_created_and_deleted():
     assert _t()["customer_dataset_delete"](dataset_key="refs_a", actor="dave") == {"deleted": True}
     conn = get_database().engine.raw_connection()
     try:
-        cur = conn.cursor()
+        cur = dialect_cursor(conn)
         assert cur.execute("SELECT COUNT(*) FROM sources WHERE name='cust_refs_a'").fetchone()[0] == 0
         assert cur.execute("SELECT COUNT(*) FROM datasources WHERE name='cust_refs_a'").fetchone()[0] == 0
         # data tables gone, audit ingest row kept
