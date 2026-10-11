@@ -89,7 +89,8 @@ def test_selfcheck_per_profile():
     # 11 business tools + provenance_wal_pending/ack (wire-provenance-ledger)
     # + wire-customer-data-engine §1–§4: query/aggregate/write_batch/
     # create_declared/add_column/derive/join_indicators/derive_refresh/lineage
-    assert cell_result["group_counts"].get("customer_dataset", 0) == 22
+    # + link (wire-entity-link §1)
+    assert cell_result["group_counts"].get("customer_dataset", 0) == 23
     default_result = selfcheck.run_invariants()
     assert "customer_dataset" not in default_result["group_counts"]
 

@@ -561,7 +561,7 @@ class TestDerive:
     def test_tool_surface_selfcheck_cell_profile(self):
         result = selfcheck.run_invariants(profile="cell")
         assert result["ok"] is True, result
-        assert result["group_counts"]["customer_dataset"] == 22
+        assert result["group_counts"]["customer_dataset"] == 23
 
 
 # ── section 4: join_indicators ───────────────────────────────────────

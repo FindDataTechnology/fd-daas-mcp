@@ -111,6 +111,7 @@ ENGINE_CAPABILITIES = {
     "derive": True,
     "derive_refresh": True,
     "join_indicators": True,
+    "link": True,
 }
 
 
@@ -1881,9 +1882,204 @@ class CustomerDatasetService:
             "unresolved_regions": unresolved_regions,
         }
 
+    def _materialize_link_child_tx(
+        self,
+        cur,
+        child_key: str,
+        columns: list[dict],
+        pk_columns: list[str],
+        left_key: str,
+        right_key: str,
+        left_table: str,
+        right_table: str,
+        left_column: str,
+        right_column: str,
+        right_plan: list[tuple[str, str]],
+        spec: dict,
+        actor: str,
+    ) -> int:
+        """CREATE-AS variant of ``_materialize_child_tx`` (wire-entity-link
+        D1): the join runs entirely SQL-side (no Python row materialization),
+        so the staging table is built by ``CREATE TABLE … AS SELECT`` — row
+        hashes come from a per-connection scalar function computing the exact
+        ``_row_hash`` canonical form. Oversize results reject the whole
+        transaction; the child keeps its previous state. ``derive``'s original
+        path is untouched."""
+        limit = _max_rows()
+        staging = _table_name(child_key, "__staging")
+        base = _table_name(child_key, "__base")
+        effective = _table_name(child_key)
+        left_names = [c["name"] for c in columns[: len(columns) - len(right_plan)]]
+        out_names = [c["name"] for c in columns]
+        cur.connection.create_function(
+            "__cust_row_hash",
+            len(out_names),
+            lambda *values: _row_hash(out_names, dict(zip(out_names, values))),
+        )
+        right_sel = ", ".join(f"r.{_quote(rn)} AS {_quote(out)}" for rn, out in right_plan)
+        hash_args = ", ".join(
+            [f"l.{_quote(n)}" for n in left_names]
+            + [f"r.{_quote(rn)}" for rn, _ in right_plan]
+        )
+        # NOTE: the left columns are listed explicitly — ``l.*`` would drag the
+        # left table's own ``__row_hash`` along (SQLite renames our aliased
+        # hash to ``__row_hash:1`` and the stale left hash would win).
+        left_sel = ", ".join(f"l.{_quote(n)}" for n in left_names)
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
+        # IS (not =) keeps equality semantics consistent for NULL keys:
+        # NULL IS NULL matches, mirroring how business keys compare elsewhere.
+        cur.execute(
+            f"CREATE TABLE {_quote(staging)} AS "
+            f"SELECT {left_sel}, {right_sel}, "
+            f"__cust_row_hash({hash_args}) AS {_quote('__row_hash')} "
+            f"FROM {_quote(left_table)} AS l LEFT JOIN {_quote(right_table)} AS r "
+            f"ON l.{_quote(left_column)} IS r.{_quote(right_column)}"
+        )
+        total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
+        if total > limit:
+            raise CustomerDatasetError(
+                f"连接行数 {total} 超过上限 {limit}（整批拒绝，子集保持原状）"
+            )
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
+        cur.execute(f"ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}")
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
+        cur.execute(f"CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}")
+        size_bytes = self._size_of(cur, effective)
+        now = _now_db()
+        cur.execute(
+            "INSERT INTO customer_datasets"
+            " (key, name, columns_json, pk_columns_json, row_count, size_bytes, created_at, updated_at, last_commit_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET columns_json=excluded.columns_json,"
+            " pk_columns_json=excluded.pk_columns_json, row_count=excluded.row_count,"
+            " size_bytes=excluded.size_bytes, updated_at=excluded.updated_at,"
+            " last_commit_at=excluded.last_commit_at",
+            (
+                child_key,
+                child_key,
+                json.dumps(columns, ensure_ascii=False),
+                json.dumps(pk_columns, ensure_ascii=False),
+                total,
+                size_bytes,
+                now,
+                now,
+                now,
+            ),
+        )
+        self._upsert_softrefs(cur, child_key)
+        self._upsert_lineage(cur, child_key, left_key, "link", spec, "ok", None)
+        _wal_append(
+            cur,
+            "dataset.derived",
+            {
+                "dataset_key": child_key,
+                "parent_key": left_key,
+                "kind": "link",
+                "rows": total,
+                "actor": actor,
+            },
+        )
+        return total
+
+    def link(
+        self,
+        child_key: str,
+        left_key: str,
+        left_column: str,
+        right_key: str,
+        right_column: str,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """Dataset-to-dataset semantic link (wire-entity-link D1): LEFT JOIN the
+        left dataset (all rows kept) with the right dataset over
+        (left_column, right_column) into a NEW child dataset, lineage recorded
+        as kind="link" (parent = left; the right side lives in the spec).
+        Right columns colliding with a left column (or an already-chosen right
+        output name) are renamed ``right_<name>`` (then ``right_<name>_2`` …);
+        uncolliding right columns keep their names. The child inherits the
+        LEFT dataset's pk declaration. ``_refresh`` is set by derive_refresh
+        (lineage already verified — skips only the child-must-not-exist gate)."""
+        child_key = _validate_key(child_key)
+        left_key = _validate_key(left_key)
+        right_key = _validate_key(right_key)
+        if left_key == right_key:
+            raise CustomerDatasetError("左右数据集不能相同")
+        if child_key in (left_key, right_key):
+            raise CustomerDatasetError("连接子集不能与左右数据集相同")
+        spec = {
+            "left_key": left_key,
+            "left_column": left_column,
+            "right_key": right_key,
+            "right_column": right_column,
+        }
+        with _tx() as cur:
+            if not _refresh and cur.execute(
+                "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
+            ).fetchone():
+                raise CustomerDatasetError(f"数据集已存在: {child_key!r}（重派生请用 derive_refresh）")
+            meta_rows = {}
+            for side, key in (("左", left_key), ("右", right_key)):
+                row = cur.execute(
+                    "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    raise CustomerDatasetError(f"{side}数据集不存在: {key!r}")
+                meta_rows[side] = row
+            left_columns = json.loads(meta_rows["左"][0]) if meta_rows["左"][0] else []
+            right_columns = json.loads(meta_rows["右"][0]) if meta_rows["右"][0] else []
+            left_names = [c["name"] for c in left_columns]
+            right_names = [c["name"] for c in right_columns]
+            if left_column not in left_names:
+                raise CustomerDatasetError(
+                    f"左列不存在: {left_column!r}（数据集 {left_key} 的列为 {left_names}）"
+                )
+            if right_column not in right_names:
+                raise CustomerDatasetError(
+                    f"右列不存在: {right_column!r}（数据集 {right_key} 的列为 {right_names}）"
+                )
+            # column plan: left columns verbatim + right columns renamed on
+            # collision (right_<name>, then _2 increments until free)
+            taken = set(left_names)
+            right_plan: list[tuple[str, str]] = []
+            for rc in right_columns:
+                rn = rc["name"]
+                out = rn if rn not in taken else f"right_{rn}"
+                n = 2
+                while out in taken:
+                    out = f"right_{rn}_{n}"
+                    n += 1
+                taken.add(out)
+                right_plan.append((rn, out))
+            out_columns = [dict(c) for c in left_columns] + [
+                {"name": out, "type": rc["type"]} for rc, (_, out) in zip(right_columns, right_plan)
+            ]
+            out_columns = _validate_columns(out_columns)
+            pk_columns = list(json.loads(meta_rows["左"][1])) if meta_rows["左"][1] else []
+            total = self._materialize_link_child_tx(
+                cur,
+                child_key,
+                out_columns,
+                pk_columns,
+                left_key,
+                right_key,
+                _table_name(left_key),
+                _table_name(right_key),
+                left_column,
+                right_column,
+                right_plan,
+                spec,
+                actor,
+            )
+        self._session.expire_all()
+        return {"dataset_key": child_key, "rows": total, "kind": "link"}
+
     def derive_refresh(self, child_key: str, actor: str = "") -> dict:
         """Re-run a derived dataset's stored spec against the parent's current
-        effective state (task 3.3). Join derivations re-fetch series first."""
+        effective state (task 3.3). Join derivations re-fetch series first;
+        link derivations re-join both sides from the recorded spec."""
         child_key = _validate_key(child_key)
         lin = _raw_query_one(
             "SELECT parent_key, kind, spec_json FROM customer_dataset_lineage WHERE dataset_key=?",
@@ -1893,6 +2089,18 @@ class CustomerDatasetService:
             raise CustomerDatasetError(f"不是派生数据集: {child_key!r}")
         parent_key, kind, spec_json = lin
         spec = json.loads(spec_json) if spec_json else {}
+        if kind == "link":
+            result = self.link(
+                child_key,
+                spec.get("left_key", ""),
+                spec.get("left_column", ""),
+                spec.get("right_key", ""),
+                spec.get("right_column", ""),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
         if kind == "join":
             result = self.join_indicators(
                 child_key,
@@ -2345,10 +2553,61 @@ def join_indicators(
         return _err(e)
 
 
+def link(
+    child_key: str,
+    left_key: str,
+    left_column: str,
+    right_key: str,
+    right_column: str,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a semantic connection between two customer datasets into a
+    NEW child dataset (wire-entity-link): LEFT JOIN semantics — every left row
+    is kept; rows whose key has no right counterpart carry NULL in the right
+    columns (never a neighbor's value). Right columns whose name collides with
+    a left column (or an already-chosen right output name) are renamed
+    ``right_<name>`` (then ``right_<name>_2`` …); uncolliding right columns
+    keep their names and types. The child inherits the LEFT dataset's pk
+    declaration and its lineage is recorded as kind="link" (parent = left
+    dataset; the right dataset and both join columns live in the spec), so
+    ``derive_refresh`` re-joins both sides' latest effective state. The join
+    runs on the effective tables (corrections apply) using SQL ``IS`` key
+    equality — NULL keys compare equal to NULL, keeping equality semantics
+    consistent. Row counts beyond the cap reject the whole operation (the
+    child keeps its previous state).
+
+    Args:
+        child_key: Slug `^[a-z][a-z0-9_]{0,39}$` for the NEW connection dataset.
+        left_key: Existing left dataset key (fully preserved side).
+        left_column: Join column in the left dataset.
+        right_key: Existing right dataset key (must differ from left_key).
+        right_column: Join column in the right dataset.
+        actor: Who initiated the link (audit).
+        channel: Write channel (audit attribution).
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.link(
+                child_key,
+                left_key,
+                left_column,
+                right_key,
+                right_column,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
 def derive_refresh(child_key: str, actor: str = "") -> dict:
     """Re-run a derived dataset's stored spec against its parent's current
     effective state. Join derivations re-fetch their indicator series first
-    (metered reads again)."""
+    (metered reads again); link derivations re-join both sides from the
+    recorded spec."""
     svc = _svc()
     try:
         return _ok(svc.derive_refresh(child_key, actor=actor))
