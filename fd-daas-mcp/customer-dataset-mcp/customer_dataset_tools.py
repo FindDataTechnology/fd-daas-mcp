@@ -13,7 +13,12 @@ canonical row JSON — computed here, uniformly for uploads and connector pushes
 ``ingest_commit`` swaps the staging table into the base atomically (single
 SQLite transaction), rebuilds the effective table and replays every active
 correction; anchors that no longer match are marked dangling (kept, never
-silently dropped). The customer source is never written to.
+silently dropped). The customer source is never written to. An optional
+``mode`` on ``ingest_begin`` selects the commit semantics: ``replace``
+(default, the atomic full-snapshot swap) or ``merge`` — an incremental
+commit that upserts the staged rows into the base by the dataset's primary
+key (connector watermark sync; rows absent from staging are kept, so
+source-side deletes never propagate).
 
 All writes go through one raw sqlite connection per call (explicit
 BEGIN IMMEDIATE … COMMIT); the ORM session is used for reads only.
@@ -88,6 +93,12 @@ QUERY_TIMEOUT_S = 5.0
 #: key / agent) — one overlay mechanism, channel-attributed semantics
 _CHANNELS = frozenset({"console", "data-key", "agent"})
 WRITE_BATCH_CAP = 1000
+
+# ── ingest modes (wire-connector-incremental-sync §1) ────────────────
+#: replace — staging atomically replaces the base (full snapshot, default);
+#: merge — staging is upserted into the base by pk_columns (incremental
+#: connector watermark sync; requires a declared primary key)
+_INGEST_MODES = frozenset({"replace", "merge"})
 
 #: advertised by ``overview`` — the fd-wire data plane probes this instead of
 #: guessing which engine tools exist (design D1; task 1.3)
@@ -569,6 +580,20 @@ def _meta_raw(cur, dataset_key: str) -> Optional[tuple[list, list, Optional[str]
     return columns, pk_columns, row[2]
 
 
+def _ensure_ingest_mode_column(cur) -> None:
+    """Lazy old-database upgrade: ``customer_dataset_ingests.mode`` (replace |
+    merge) did not exist before wire-connector-incremental-sync. First use
+    checks PRAGMA table_info and ALTERs the column in with the 'replace'
+    default — the same lazy pattern as the WAL table and the engine's other
+    additive ALTERs (old rows read back as replace semantics)."""
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(customer_dataset_ingests)")}
+    if cols and "mode" not in cols:
+        cur.execute(
+            "ALTER TABLE customer_dataset_ingests"
+            " ADD COLUMN mode TEXT NOT NULL DEFAULT 'replace'"
+        )
+
+
 class CustomerDatasetService:
     """Thin orchestration over raw SQL: one connection + one transaction per
     mutation (data and metadata together, so swaps stay atomic); ORM session
@@ -599,6 +624,7 @@ class CustomerDatasetService:
         row_count: Optional[int] = None,
         actor: str = "",
         name: Optional[str] = None,
+        mode: str = "replace",
     ) -> dict:
         dataset_key = _validate_key(dataset_key)
         columns = _validate_columns(columns)
@@ -607,11 +633,18 @@ class CustomerDatasetService:
         for pk in pk_columns:
             if pk not in col_names:
                 raise CustomerDatasetError(f"主键列不在 columns 中: {pk!r}")
+        mode = str(mode or "replace")
+        if mode not in _INGEST_MODES:
+            raise CustomerDatasetError(f"非法 ingest 模式: {mode!r}（允许 replace/merge）")
+        if mode == "merge" and not pk_columns:
+            raise CustomerDatasetError("merge 模式要求数据集声明主键")
 
         ingest_id = str(uuid.uuid4())
         staging = _table_name(dataset_key, "__staging")
         now = _now_db()
         with _tx() as cur:
+            # old databases predate the mode column — additive lazy ALTER
+            _ensure_ingest_mode_column(cur)
             # any in-flight ingest for this key is superseded
             cur.execute(
                 "UPDATE customer_dataset_ingests SET status='aborted', finished_at=?,"
@@ -642,12 +675,12 @@ class CustomerDatasetService:
                 ),
             )
             cur.execute(
-                "INSERT INTO customer_dataset_ingests (id, dataset_key, status, row_count, actor, started_at)"
-                " VALUES (?, ?, 'open', ?, ?, ?)",
-                (ingest_id, dataset_key, row_count, actor, now),
+                "INSERT INTO customer_dataset_ingests (id, dataset_key, status, row_count, actor, mode, started_at)"
+                " VALUES (?, ?, 'open', ?, ?, ?, ?)",
+                (ingest_id, dataset_key, row_count, actor, mode, now),
             )
         self._session.expire_all()
-        return {"ingest_id": ingest_id, "staging_table": staging}
+        return {"ingest_id": ingest_id, "staging_table": staging, "mode": mode}
 
     def ingest_chunk(self, ingest_id: str, rows: list, start_index: int) -> dict:
         if not isinstance(rows, list) or not rows:
@@ -685,39 +718,64 @@ class CustomerDatasetService:
 
     def ingest_commit(self, ingest_id: str) -> dict:
         with _tx() as cur:
+            # old databases predate the mode column — additive lazy ALTER
+            # (also upgrades a row left open by a pre-mode engine build)
+            _ensure_ingest_mode_column(cur)
             found = cur.execute(
-                "SELECT dataset_key, status FROM customer_dataset_ingests WHERE id=?",
+                "SELECT dataset_key, status, mode FROM customer_dataset_ingests WHERE id=?",
                 (ingest_id,),
             ).fetchone()
             if not found:
                 raise CustomerDatasetError(f"ingest 不存在: {ingest_id!r}")
-            dataset_key, status = found
+            dataset_key, status, ingest_mode = found
             if status != "open":
                 raise CustomerDatasetError(f"ingest 状态为 {status}，不能提交")
+            ingest_mode = ingest_mode or "replace"
 
             staging = _table_name(dataset_key, "__staging")
             base = _table_name(dataset_key, "__base")
             effective = _table_name(dataset_key)
-            total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
-            limit = _max_rows()
-            if total > limit:
-                raise CustomerDatasetError(f"行数 {total} 超过上限 {limit}（拒收，旧快照保留）")
 
-            meta = _meta_raw(cur, dataset_key)
-            if meta is None:
-                raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
-            columns, pk_columns, _name = meta
+            if ingest_mode == "merge":
+                # incremental commit: upsert staging into base by pk. The merge
+                # needs the declared columns/pk before touching data; the cap
+                # is judged on the POST-merge total inside the helper.
+                meta = _meta_raw(cur, dataset_key)
+                if meta is None:
+                    raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
+                columns, pk_columns, _name = meta
+                incoming = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
+                total = self._merge_staging_into_base(
+                    cur, staging, base, effective, columns, pk_columns
+                )
+                # provenance: the incremental merge landed — same transaction
+                _wal_append(
+                    cur,
+                    "dataset.incremental.merged",
+                    {"dataset_key": dataset_key, "rows": total, "incoming": int(incoming)},
+                )
+            else:
+                # full snapshot: the staged table atomically replaces the base
+                total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
+                limit = _max_rows()
+                if total > limit:
+                    raise CustomerDatasetError(f"行数 {total} 超过上限 {limit}（拒收，旧快照保留）")
 
-            # atomic swap: staging → base, then rebuild the effective table
-            cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
-            cur.execute(f'ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}')
-            cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
-            cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
+                meta = _meta_raw(cur, dataset_key)
+                if meta is None:
+                    raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
+                columns, pk_columns, _name = meta
 
-            # provenance: the snapshot landed — same transaction as the swap
-            _wal_append(
-                cur, "dataset.snapshot.refreshed", {"dataset_key": dataset_key, "rows": total}
-            )
+                # atomic swap: staging → base, then rebuild the effective table
+                cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
+                cur.execute(f'ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}')
+                cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
+                cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
+
+                # provenance: the snapshot landed — same transaction as the swap
+                _wal_append(
+                    cur, "dataset.snapshot.refreshed", {"dataset_key": dataset_key, "rows": total}
+                )
 
             replayed, _dangling_now = self._replay_corrections(
                 cur, dataset_key, effective, columns, pk_columns
@@ -747,6 +805,75 @@ class CustomerDatasetService:
             "corrections_replayed": replayed,
             "corrections_dangling": dangling_total,
         }
+
+    @staticmethod
+    def _merge_staging_into_base(
+        cur, staging: str, base: str, effective: str, columns: list[str], pk_columns: list[str]
+    ) -> int:
+        """merge 提交的数据落地（连接器增量水位同步，wire-connector-incremental
+        §1）：staging 按主键 upsert 进 base —— 既有主键行整行更新（含
+        ``__row_hash``），新主键行插入；staging 未提及的既有行原样保留（源端
+        删除不传播）。base 表没有主键约束（staging 建表只有列+__row_hash），
+        不能用 ``ON CONFLICT``，因此走同一事务内的两步 SQL：UPDATE…FROM
+        （SQLite 3.33+）+ INSERT…SELECT…WHERE NOT EXISTS，标识符全部经
+        ``_quote``。主键为 NULL 的行整批拒绝（口径：NULL 主键不许进 merge）。
+        返回合并后的 base 行数；合并后总数超过 ``_max_rows()`` 时 raise，
+        整事务回滚（零写入，旧数据保留，与 replace 路径超限行为同构）。"""
+        if not pk_columns:
+            raise CustomerDatasetError("merge 模式要求数据集声明主键")
+        # gate 1 — reject NULL primary keys before touching base
+        null_pk = " OR ".join(f"s.{_quote(p)} IS NULL" for p in pk_columns)
+        nulls = int(
+            cur.execute(
+                f"SELECT COUNT(*) FROM {_quote(staging)} AS s WHERE {null_pk}"
+            ).fetchone()[0]
+        )
+        if nulls:
+            raise CustomerDatasetError(
+                f"merge 拒收：staging 有 {nulls} 行主键为 NULL（整批拒绝，base 未动）"
+            )
+        has_base = (
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (base,)
+            ).fetchone()
+            is not None
+        )
+        if not has_base:
+            # first-ever commit for the key — nothing to merge into, so the
+            # incremental window degenerates to the plain snapshot swap
+            cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
+            cur.execute(f'ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}')
+        else:
+            on_chain = " AND ".join(f"b.{_quote(p)} = s.{_quote(p)}" for p in pk_columns)
+            # step 1 — update every existing pk row (all columns + __row_hash)
+            set_exprs = [f"{_quote(c)} = s.{_quote(c)}" for c in columns]
+            set_exprs.append(f'{_quote("__row_hash")} = s.{_quote("__row_hash")}')
+            cur.execute(
+                f"UPDATE {_quote(base)} AS b SET {', '.join(set_exprs)}"
+                f" FROM {_quote(staging)} AS s WHERE {on_chain}"
+            )
+            # step 2 — insert the new pk rows only
+            collist = ", ".join(_quote(c) for c in columns + ["__row_hash"])
+            sellist = ", ".join(f"s.{_quote(c)}" for c in columns + ["__row_hash"])
+            cur.execute(
+                f"INSERT INTO {_quote(base)} ({collist})"
+                f" SELECT {sellist} FROM {_quote(staging)} AS s"
+                f" WHERE NOT EXISTS (SELECT 1 FROM {_quote(base)} AS b WHERE {on_chain})"
+            )
+            # merged data is durably in base — the staging window is spent
+            cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
+        # gate 2 — the row cap judges the POST-merge total
+        total = int(cur.execute(f"SELECT COUNT(*) FROM {_quote(base)}").fetchone()[0])
+        limit = _max_rows()
+        if total > limit:
+            raise CustomerDatasetError(
+                f"合并后行数 {total} 超过上限 {limit}（整事务回滚，旧数据保留）"
+            )
+        # rebuild the effective table from the merged base (corrections are
+        # replayed on top by the caller, inside the same transaction)
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
+        cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
+        return total
 
     def ingest_abort(self, ingest_id: str) -> dict:
         with _tx() as cur:
@@ -1875,6 +2002,7 @@ def ingest_begin(
     pk_columns: Optional[list] = None,
     row_count: Optional[int] = None,
     actor: str = "",
+    mode: str = "replace",
 ) -> dict:
     """Begin a full-snapshot ingest for a customer dataset (registers/refreshes
     the dataset metadata and creates the staging table). Supersedes any
@@ -1886,10 +2014,24 @@ def ingest_begin(
         pk_columns: Optional primary-key column names (row anchor: pk-first).
         row_count: Optional expected total row count (informational).
         actor: Who initiated the ingest (audit).
+        mode: Commit semantics: `replace` (default — the staged snapshot
+            atomically replaces the base) or `merge` (incremental — the staged
+            rows are upserted into the base by pk_columns; requires pk_columns;
+            rows absent from staging are kept, so source-side deletes never
+            propagate).
     """
     svc = _svc()
     try:
-        return _ok(svc.ingest_begin(dataset_key, columns, pk_columns=pk_columns, row_count=row_count, actor=actor))
+        return _ok(
+            svc.ingest_begin(
+                dataset_key,
+                columns,
+                pk_columns=pk_columns,
+                row_count=row_count,
+                actor=actor,
+                mode=mode,
+            )
+        )
     except Exception as e:
         return _err(e)
 
@@ -1905,9 +2047,12 @@ def ingest_chunk(ingest_id: str, rows: list, start_index: int) -> dict:
 
 
 def ingest_commit(ingest_id: str) -> dict:
-    """Atomically swap the staged snapshot into the base table, rebuild the
-    effective table and replay all active corrections (dangling anchors are
-    marked, never dropped). Returns rows/size/corrections stats."""
+    """Commit an open ingest per its begin-time mode: `replace` atomically
+    swaps the staged snapshot into the base table; `merge` upserts the staged
+    rows into the base by the dataset's primary key (rows absent from staging
+    are kept). Either way the effective table is rebuilt and all active
+    corrections replayed (dangling anchors are marked, never dropped). Returns
+    rows/size/corrections stats."""
     svc = _svc()
     try:
         return _ok(svc.ingest_commit(ingest_id))
