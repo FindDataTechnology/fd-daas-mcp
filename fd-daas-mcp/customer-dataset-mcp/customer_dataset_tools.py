@@ -136,6 +136,42 @@ def _max_rows() -> int:
         return DEFAULT_MAX_ROWS
 
 
+def _storage_quota_bytes() -> Optional[int]:
+    """Second size gate (openspec: wire-cell-storage-quota): env
+    ``FD_CELL_STORAGE_QUOTA_MB`` — a positive integer arms a storage quota in
+    bytes. Unset / non-numeric / non-positive → None (quota off, the default
+    posture; never raises). Parsed per call — no module-level cache, so tests
+    can arm/disarm the env inside one process."""
+    raw = os.environ.get("FD_CELL_STORAGE_QUOTA_MB")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        mb = int(raw.strip())
+    except ValueError:
+        return None
+    return mb * 1024 * 1024 if mb > 0 else None
+
+
+def _enforce_storage_quota(cur) -> None:
+    """Reject an incremental write transaction when the PostgreSQL data
+    root's storage usage exceeds the configured quota — the whole batch is
+    rejected BEFORE any DML runs, so prior data stays intact. No-op unless
+    BOTH the env quota is armed AND the backend is PostgreSQL (the sqlite
+    leg never touches this gate — behavior stays byte-identical there)."""
+    quota = _storage_quota_bytes()
+    if quota is None or not db_dialect.is_postgres():
+        return
+    row = cur.execute("SELECT pg_database_size(current_database())").fetchone()
+    used = int(row[0]) if row else 0
+    if used > quota:
+        used_mb = used / (1024 * 1024)
+        quota_mb = quota // (1024 * 1024)
+        raise CustomerDatasetError(
+            f"存储用量 {used_mb:.1f}MB 超过上限 {quota_mb}MB"
+            "（整批拒绝，数据保留；如需扩容请联系管理员调整配额）"
+        )
+
+
 def _quote(ident: str) -> str:
     return '"' + ident.replace('"', '""') + '"'
 
@@ -783,6 +819,9 @@ class CustomerDatasetService:
 
     def ingest_commit(self, ingest_id: str) -> dict:
         with _tx() as cur:
+            # storage quota gate — FIRST statement, before any DML: the whole
+            # commit (replace swap or incremental merge) is judged up front
+            _enforce_storage_quota(cur)
             # old databases predate the mode column — additive lazy ALTER
             # (also upgrades a row left open by a pre-mode engine build)
             _ensure_ingest_mode_column(cur)
@@ -1070,7 +1109,18 @@ class CustomerDatasetService:
 
     def overview(self, dataset_key: str) -> dict:
         meta = self._meta(_validate_key(dataset_key))
-        return {**meta.to_dict(), "capabilities": dict(ENGINE_CAPABILITIES)}
+        out = {**meta.to_dict(), "capabilities": dict(ENGINE_CAPABILITIES)}
+        # storage-quota observability (wire-cell-storage-quota): the two
+        # fields appear ONLY when the quota is armed AND the backend is
+        # PostgreSQL — otherwise the response shape is unchanged. This is a
+        # read path; the one pg_database_size read is reporting, not the
+        # write gate.
+        quota = _storage_quota_bytes()
+        if quota is not None and db_dialect.is_postgres():
+            row = _raw_query_one("SELECT pg_database_size(current_database())")
+            out["storage_quota_bytes"] = quota
+            out["storage_used_bytes"] = int(row[0]) if row else 0
+        return out
 
     def preview(
         self, dataset_key: str, limit: int = 50, offset: int = 0, include_corrected: bool = True
@@ -1478,6 +1528,8 @@ class CustomerDatasetService:
                     f"批量写后行数 {int(current) + inserts} 将超过上限 {limit}（整批拒绝）"
                 )
         with _tx() as cur:
+            # storage quota gate — before the first edit of the batch
+            _enforce_storage_quota(cur)
             correction_ids: list[int] = []
             for i, (op, anchor, values) in enumerate(checked):
                 try:
@@ -1800,6 +1852,8 @@ class CustomerDatasetService:
             raise CustomerDatasetError("派生子集不能与父集相同")
         spec = {"filters": filters or [], "sort": sort or [], "limit": limit}
         with _tx() as cur:
+            # storage quota gate — before the child materialization begins
+            _enforce_storage_quota(cur)
             if cur.execute(
                 "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
             ).fetchone():
@@ -1928,6 +1982,8 @@ class CustomerDatasetService:
             "default_entity": default_entity,
         }
         with _tx() as cur:
+            # storage quota gate — before the child materialization begins
+            _enforce_storage_quota(cur)
             if not _refresh and cur.execute(
                 "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
             ).fetchone():
@@ -2129,6 +2185,10 @@ class CustomerDatasetService:
             "right_column": right_column,
         }
         with _tx() as cur:
+            # storage quota gate — FIRST statement of the link materialization
+            # transaction (an over-quota link reports the quota error, never a
+            # half-built child)
+            _enforce_storage_quota(cur)
             if not _refresh and cur.execute(
                 "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
             ).fetchone():
@@ -2239,6 +2299,10 @@ class CustomerDatasetService:
             result["refreshed"] = True
             return result
         with _tx() as cur:
+            # storage quota gate — the query-kind re-materialization tx (the
+            # link/join kinds refresh through link/join_indicators above,
+            # whose own transaction heads carry the gate)
+            _enforce_storage_quota(cur)
             rows, columns, pk_columns = self._source_rows_and_meta(
                 cur, parent_key, spec.get("filters"), spec.get("sort"), spec.get("limit")
             )
@@ -2400,7 +2464,9 @@ def ingest_abort(ingest_id: str) -> dict:
 
 
 def overview(dataset_key: str) -> dict:
-    """Dataset metadata: columns, pk_columns, rows, size_bytes, last_commit_at."""
+    """Dataset metadata: columns, pk_columns, rows, size_bytes, last_commit_at.
+    When FD_CELL_STORAGE_QUOTA_MB is armed on the PostgreSQL backend, also
+    storage_quota_bytes / storage_used_bytes (pg_database_size)."""
     svc = _svc()
     try:
         return _ok(svc.overview(dataset_key))
