@@ -90,7 +90,9 @@ def test_selfcheck_per_profile():
     # + wire-customer-data-engine §1–§4: query/aggregate/write_batch/
     # create_declared/add_column/derive/join_indicators/derive_refresh/lineage
     # + quality (wire-asset-catalog §3: read-only quality snapshot)
-    assert cell_result["group_counts"].get("customer_dataset", 0) == 23
+    # + link (wire-transform-pipelines §1 / wire-entity-link: LEFT-JOIN
+    #   materializer, replayed through derive_refresh)
+    assert cell_result["group_counts"].get("customer_dataset", 0) == 24
     default_result = selfcheck.run_invariants()
     assert "customer_dataset" not in default_result["group_counts"]
 

@@ -177,8 +177,9 @@ groups:
   # Client-owned datasets (wire cell only — deployment profile `cell`;
   # wire-customer-local-data + ADR-0001). Cell-local and client-private: never
   # part of the commercial catalog surface — group-level internal covers all
-  # 23 tools (reads included; among them the read-only quality snapshot of
-  # wire-asset-catalog §3, which emits aggregate counts/ratios only).
+  # 24 tools (reads included; among them the read-only quality snapshot of
+  # wire-asset-catalog §3, which emits aggregate counts/ratios only, and the
+  # wire-entity-link / wire-transform-pipelines LEFT-JOIN materializer link).
   customer_dataset:
     level: internal
 

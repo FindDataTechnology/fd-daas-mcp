@@ -297,6 +297,7 @@ class TestCapabilities:
             "derive",
             "derive_refresh",
             "join_indicators",
+            "link",
             "quality",
         ):
             assert name in caps
@@ -563,7 +564,8 @@ class TestDerive:
         result = selfcheck.run_invariants(profile="cell")
         assert result["ok"] is True, result
         # 22 tools + quality (wire-asset-catalog §3 read-only quality snapshot)
-        assert result["group_counts"]["customer_dataset"] == 23
+        # + link (wire-transform-pipelines §1: LEFT-JOIN materializer)
+        assert result["group_counts"]["customer_dataset"] == 24
 
 
 # ── section 4: join_indicators ───────────────────────────────────────

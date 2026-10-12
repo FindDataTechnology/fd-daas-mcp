@@ -30,6 +30,7 @@ from customer_dataset_tools import (
     add_column,
     derive,
     join_indicators,
+    link,
     derive_refresh,
     lineage,
     delete,
@@ -55,6 +56,7 @@ app.tool(create_declared)
 app.tool(add_column)
 app.tool(derive)
 app.tool(join_indicators)
+app.tool(link)
 app.tool(derive_refresh)
 app.tool(lineage)
 app.tool(delete)
