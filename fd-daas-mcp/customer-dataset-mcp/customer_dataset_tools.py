@@ -66,6 +66,7 @@ if str(_DAAS_MCP_DIR) not in sys.path:
 
 from daas_database import get_database  # noqa: E402
 from models import CustomerDataset, CustomerDatasetCorrection, CustomerDatasetIngest  # noqa: E402
+from sqlalchemy import inspect as sa_inspect, text as sa_text  # noqa: E402
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _COL_RE = re.compile(r'^[^\x00-\x1f"]{1,64}$')
@@ -100,8 +101,18 @@ WRITE_BATCH_CAP = 1000
 #: connector watermark sync; requires a declared primary key)
 _INGEST_MODES = frozenset({"replace", "merge"})
 
+# ── quality snapshot (wire-asset-catalog §3) ─────────────────────────
+#: null-rate sampling cap: the per-column null-rate pass fetches at most
+#: this many rows of the effective table (one sampled scan, NULLs counted
+#: in Python). Count-side metrics (row_count, pk uniqueness) stay exact
+#: over the FULL table — only the null-rate pass is sampled; when the table
+#: has more rows than the cap, sample_limit_hit=True reports the capping.
+QUALITY_SAMPLE_ROW_LIMIT = 10_000
+
 #: advertised by ``overview`` — the fd-wire data plane probes this instead of
-#: guessing which engine tools exist (design D1; task 1.3)
+#: guessing which engine tools exist (design D1; task 1.3). ``quality`` is the
+#: read-only quality snapshot (wire-asset-catalog §3) — a False/absent value
+#: is exactly how the platform detects an engine too old for quality.
 ENGINE_CAPABILITIES = {
     "query": True,
     "aggregate": True,
@@ -111,6 +122,7 @@ ENGINE_CAPABILITIES = {
     "derive": True,
     "derive_refresh": True,
     "join_indicators": True,
+    "quality": True,
 }
 
 
@@ -531,6 +543,23 @@ def _raw_query_all(sql: str, params: tuple = ()) -> list[tuple]:
         return cur.fetchall()
     finally:
         conn.close()
+
+
+def _quality_query_all(sql: str) -> list[tuple]:
+    """Dialect-neutral read for the quality snapshot (wire-asset-catalog §3).
+
+    The cell data root may be SQLite or PostgreSQL (wire-cell-postgres-
+    storage storage profile); the write paths above ride the raw sqlite3
+    connection (``?`` placeholders), but the quality SQL must run on both
+    dialects — so it goes through SQLAlchemy ``text()`` on the shared engine
+    (the paramstyle adapts) and is built ONLY from plain standard aggregates
+    (``COUNT(*)``, ``COUNT(DISTINCT col)``, a sampled subquery with
+    ``LIMIT``) plus double-quoted identifiers out of validated dataset
+    metadata. It carries NO bound parameters and no user-supplied fragment
+    can enter the SQL text (the sample limit is a module constant).
+    """
+    with get_database().engine.connect() as conn:
+        return list(conn.execute(sa_text(sql)))
 
 
 def _validate_key(dataset_key: str) -> str:
@@ -1179,6 +1208,115 @@ class CustomerDatasetService:
             "groups": groups,
             "group_count": int(total),
             "truncated": int(total) > len(groups),
+        }
+
+    # ── quality snapshot (wire-asset-catalog §3) ─────────────────────
+
+    def quality(self, dataset_key: str) -> dict:
+        """Quality snapshot over the effective table (wire-asset-catalog §3,
+        engine side — the platform never reads cell data directly, it only
+        receives this aggregate payload): row count, computed_at, primary-key
+        uniqueness ratio and per-column sampled null rates.
+
+        Honesty rules (spec wire-dataset-quality):
+        - a dataset that declares no pk columns gets ``pk_declared=False`` and
+          ``pk_uniqueness=None`` (未声明键列 — no ratio is invented);
+        - null rates are computed on ONE sampled scan capped at
+          ``QUALITY_SAMPLE_ROW_LIMIT`` rows; ``sample_limit_hit`` says whether
+          the cap was hit (≤ cap ⇒ rates are exact);
+        - the effective table is ``cust_<key>`` exactly as the query tools
+          resolve it; a dataset that somehow only has its ``__base`` snapshot
+          is measured on that — honestly, never fabricated.
+
+        Read-only observation: no writes, no WAL events, no new tables.
+
+        Dual dialect (wire-cell-postgres-storage): plain standard aggregates
+        only — COUNT(*) / COUNT(DISTINCT col) / a sampled subquery with
+        LIMIT — no dialect-specific functions (see ``_quality_query_all``).
+
+        PAYLOAD RED LINE: the result carries ONLY aggregate counts/ratios and
+        column/dataset names — it must NEVER contain data values, sample rows
+        or cell contents (the platform stores it verbatim; sampled values are
+        counted in-frame here and then dropped).
+        """
+        dataset_key = _validate_key(dataset_key)
+        meta = self._meta(dataset_key)  # unknown key → 数据集不存在 (same honest error as every read tool)
+        columns = [c["name"] for c in (meta.columns_json or [])]
+        pk_columns = list(meta.pk_columns_json or [])
+
+        # effective-table resolution mirrors preview/query (base + corrections
+        # overlay); existence is checked via the dialect-neutral inspector
+        # (sqlite_master probes are sqlite-only).
+        engine = get_database().engine
+        effective = _table_name(dataset_key)
+        base = _table_name(dataset_key, "__base")
+        if sa_inspect(engine).has_table(effective):
+            table = effective
+        elif sa_inspect(engine).has_table(base):
+            table = base
+        else:
+            raise CustomerDatasetError(f"数据集尚未完成首次提交，没有可读的数据表: {dataset_key!r}")
+        qt = _quote(table)
+
+        row_count = int(_quality_query_all(f"SELECT COUNT(*) FROM {qt}")[0][0])
+
+        # pk uniqueness = COUNT(DISTINCT pk)/COUNT(*). Single-column pk uses
+        # COUNT(DISTINCT col) directly (NULL keys are NOT counted as distinct
+        # — a NULL pk is a quality problem the ratio must not hide); a
+        # composite pk uses the portable DISTINCT-subquery form because
+        # COUNT(DISTINCT a, b) is not standard SQL. A declared-but-empty
+        # table is vacuously unique (no duplicate keys can exist → 1.0).
+        pk_uniqueness: Optional[dict] = None
+        if pk_columns:
+            if len(pk_columns) == 1:
+                distinct = int(
+                    _quality_query_all(
+                        f"SELECT COUNT(DISTINCT {_quote(pk_columns[0])}) FROM {qt}"
+                    )[0][0]
+                )
+            else:
+                pklist = ", ".join(_quote(c) for c in pk_columns)
+                distinct = int(
+                    _quality_query_all(
+                        f"SELECT COUNT(*) FROM (SELECT DISTINCT {pklist} FROM {qt})"
+                    )[0][0]
+                )
+            unique_ratio = (distinct / row_count) if row_count > 0 else 1.0
+            pk_uniqueness = {"columns": pk_columns, "unique_ratio": unique_ratio}
+
+        # per-column null rates on one sampled scan: fetch ONLY the declared
+        # columns (the internal ``__row_hash`` anchor column is hidden from
+        # queries and hidden here too), count NULLs in Python — the values
+        # never leave this frame.
+        collist = ", ".join(_quote(c) for c in columns)
+        sample = _quality_query_all(
+            f"SELECT {collist} FROM {qt} LIMIT {QUALITY_SAMPLE_ROW_LIMIT}"
+        )
+        sampled_rows = len(sample)
+        nulls = [0] * len(columns)
+        for row in sample:
+            for i, value in enumerate(row):
+                if value is None:
+                    nulls[i] += 1
+        null_rates = [
+            {
+                "column": c,
+                "null_rate": (nulls[i] / sampled_rows) if sampled_rows else 0.0,
+                "sampled_rows": sampled_rows,
+            }
+            for i, c in enumerate(columns)
+        ]
+
+        # assertion-style red line: aggregate counts/ratios + names only —
+        # no data values, no sample rows, no cell contents in the payload.
+        return {
+            "dataset_key": dataset_key,
+            "row_count": row_count,
+            "computed_at": _now_wal(),  # ISO-8601 UTC (platform-facing)
+            "pk_declared": bool(pk_columns),
+            "pk_uniqueness": pk_uniqueness,  # None ⇔ 未声明键列
+            "null_rates": null_rates,
+            "sample_limit_hit": row_count > QUALITY_SAMPLE_ROW_LIMIT,
         }
 
     # ── corrections ──────────────────────────────────────────────────
@@ -2160,6 +2298,28 @@ def aggregate(
         return _ok(
             svc.aggregate(dataset_key, group_by=group_by, measures=measures, filters=filters, raw=raw)
         )
+    except Exception as e:
+        return _err(e)
+
+
+def quality(dataset_key: str) -> dict:
+    """Quality snapshot for a customer dataset (wire-asset-catalog §3): row
+    count, computed_at, primary-key uniqueness and per-column sampled null
+    rates. Honest shapes: a dataset with no declared pk columns returns
+    `pk_declared=false` and `pk_uniqueness=null` (未声明键列 — no ratio is
+    invented); null rates are sampled (at most 10,000 rows, one scan) and
+    `sample_limit_hit=true` flags the cap. The payload carries ONLY aggregate
+    counts/ratios and names — never data values, sample rows or cell contents.
+    Read-only observation tool: no writes, no provenance events, no new
+    tables; the SQL is plain standard aggregates, dialect-neutral over the
+    cell's SQLite/PostgreSQL data root.
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+    """
+    svc = _svc()
+    try:
+        return _ok(svc.quality(dataset_key))
     except Exception as e:
         return _err(e)
 

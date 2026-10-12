@@ -29,7 +29,7 @@
 # when skipped.
 manifest_version: 1
 server: fd-daas-mcp
-updated: '2026-10-06'
+updated: '2026-10-13'
 
 # Product skills allowed into packs (facet-mcp-foundation-v1 task 3.2).
 skills:
@@ -177,7 +177,8 @@ groups:
   # Client-owned datasets (wire cell only — deployment profile `cell`;
   # wire-customer-local-data + ADR-0001). Cell-local and client-private: never
   # part of the commercial catalog surface — group-level internal covers all
-  # eleven tools (reads included).
+  # 23 tools (reads included; among them the read-only quality snapshot of
+  # wire-asset-catalog §3, which emits aggregate counts/ratios only).
   customer_dataset:
     level: internal
 

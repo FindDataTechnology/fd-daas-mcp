@@ -20,6 +20,7 @@ from customer_dataset_tools import (
     preview,
     query,
     aggregate,
+    quality,
     correction_add,
     correction_list,
     correction_dangling,
@@ -44,6 +45,7 @@ app.tool(overview)
 app.tool(preview)
 app.tool(query)
 app.tool(aggregate)
+app.tool(quality)
 app.tool(correction_add)
 app.tool(correction_list)
 app.tool(correction_dangling)

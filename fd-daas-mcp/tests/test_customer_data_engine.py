@@ -297,6 +297,7 @@ class TestCapabilities:
             "derive",
             "derive_refresh",
             "join_indicators",
+            "quality",
         ):
             assert name in caps
 
@@ -561,7 +562,8 @@ class TestDerive:
     def test_tool_surface_selfcheck_cell_profile(self):
         result = selfcheck.run_invariants(profile="cell")
         assert result["ok"] is True, result
-        assert result["group_counts"]["customer_dataset"] == 22
+        # 22 tools + quality (wire-asset-catalog §3 read-only quality snapshot)
+        assert result["group_counts"]["customer_dataset"] == 23
 
 
 # ── section 4: join_indicators ───────────────────────────────────────
