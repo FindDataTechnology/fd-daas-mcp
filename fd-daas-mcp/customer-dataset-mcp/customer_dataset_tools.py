@@ -3232,7 +3232,7 @@ def _run_check_batch(dataset_key: str, checks: list, columns: list) -> dict:
     return {"results": results, "element_count": element_count}
 
 
-def customer_dataset_check(dataset_key: str, checks: list) -> dict:
+def check(dataset_key: str, checks: list) -> dict:
     """Batch content-level checks over a customer dataset
     (openspec: wire-quality-rules-v2). Each check: {kind, ...}:
     - regex: {kind: "regex", column, pattern} — pattern length ≤128, no
@@ -3264,7 +3264,7 @@ def customer_dataset_check(dataset_key: str, checks: list) -> dict:
         return _err(e)
 
 
-def customer_dataset_quality(dataset_key: str) -> dict:
+def quality(dataset_key: str) -> dict:
     """Quality snapshot aggregates for one dataset (openspec:
     wire-quality-rules-v2; payload shape aligned field-by-field with the
     platform-side sanitizer). Returns {row_count, computed_at, pk_declared,

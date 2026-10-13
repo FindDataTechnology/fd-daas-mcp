@@ -12,8 +12,8 @@ from fastmcp import FastMCP
 app = FastMCP(name="customer-dataset-mcp")
 
 from customer_dataset_tools import (
-    customer_dataset_check,
-    customer_dataset_quality,
+    check,
+    quality,
     ingest_begin,
     ingest_chunk,
     ingest_commit,
@@ -62,9 +62,10 @@ app.tool(lineage)
 app.tool(delete)
 app.tool(provenance_wal_pending)
 app.tool(provenance_wal_ack)
-# 质量计算体（openspec: wire-quality-rules-v2）
-app.tool(customer_dataset_check)
-app.tool(customer_dataset_quality)
+# 质量计算体（openspec: wire-quality-rules-v2）——函数短名：group 名
+# customer_dataset 由注册层自动加前缀（同 overview/query 既有先例）
+app.tool(check)
+app.tool(quality)
 
 if __name__ == "__main__":
     app.run(transport="stdio", show_banner=False)

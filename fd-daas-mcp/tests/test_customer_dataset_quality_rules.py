@@ -72,7 +72,7 @@ def _results(payload):
 
 
 def test_regex_pass_and_fail(dataset):
-    payload = _call('customer_dataset_check', 
+    payload = _call('check', 
         dataset, [{"kind": "regex", "column": "code", "pattern": r"^[A-Z]{2}\d{4}$"}]
     )
     (result,) = _results(payload)
@@ -84,7 +84,7 @@ def test_regex_pass_and_fail(dataset):
     # 允许小写的模式 → 全过（regex 不区分列内既有值的大小写策略，
     # 由 pattern 自行表达：这里显式含小写字母）
     payload = _call(
-        "customer_dataset_check",
+        "check",
         dataset, [{"kind": "regex", "column": "code", "pattern": r"^[A-Za-z0-9]+$"}]
     )
     (result,) = _results(payload)
@@ -94,7 +94,7 @@ def test_regex_pass_and_fail(dataset):
 
 def test_col_compare_six_ops_and_null_exemption(dataset):
     # 3 < 4 → 一行违规；NULL 行豁免（两侧都有值时强制比较）
-    payload = _call('customer_dataset_check', 
+    payload = _call('check', 
         dataset,
         [
             {"kind": "col_compare", "col_a": "end_d", "op": "gte", "col_b": "start_d"},
@@ -108,7 +108,7 @@ def test_col_compare_six_ops_and_null_exemption(dataset):
     assert lte["unexpected_count"] == 1  # 5>1 那行不满足 lte
 
     # 同列拒
-    payload = _call('customer_dataset_check', 
+    payload = _call('check', 
         dataset, [{"kind": "col_compare", "col_a": "age", "op": "gte", "col_b": "age"}]
     )
     (result,) = _results(payload)
@@ -117,7 +117,7 @@ def test_col_compare_six_ops_and_null_exemption(dataset):
 
 def test_range_closed_interval_and_nulls(dataset):
     # age=70 越上界 → 1 违例；age=NULL 豁免；非数值计违例（本数据集无数值外形态）
-    payload = _call('customer_dataset_check', 
+    payload = _call('check', 
         dataset, [{"kind": "range", "column": "age", "min": 18, "max": 60}]
     )
     (result,) = _results(payload)
@@ -131,14 +131,14 @@ def test_pattern_compile_gate(dataset):
         {"kind": "regex", "column": "code", "pattern": "a" * 200},
         {"kind": "regex", "column": "code", "pattern": "("},
     ):
-        payload = _call('customer_dataset_check', dataset, [bad])
+        payload = _call('check', dataset, [bad])
         (result,) = _results(payload)
         assert result["status"] == "error", bad
         assert result["unexpected_count"] is None  # 不误报 fail
 
 
 def test_batch_size_gate(dataset):
-    payload = _call('customer_dataset_check', 
+    payload = _call('check', 
         dataset, [{"kind": "range", "column": "age", "min": 0}] * 6
     )
     assert payload.get("success") is False
@@ -146,7 +146,7 @@ def test_batch_size_gate(dataset):
 
 
 def test_unknown_kind_isolated(dataset):
-    payload = _call('customer_dataset_check', 
+    payload = _call('check', 
         dataset,
         [
             {"kind": "exec_shell", "column": "code"},
@@ -162,10 +162,10 @@ def test_sample_zero_return_honeypot(dataset):
     """honeypot：违规值/样本行绝不出现在返回体（含 error 分支）。"""
     payloads = [
         _call(
-            "customer_dataset_check",
+            "check",
             dataset, [{"kind": "regex", "column": "code", "pattern": r"^Z"}]
         ),
-        _call("customer_dataset_quality", dataset),
+        _call("quality", dataset),
     ]
     blob = json.dumps(payloads, ensure_ascii=False)
     for needle in ("xx99", "AB1234", "CD5678"):
@@ -173,7 +173,7 @@ def test_sample_zero_return_honeypot(dataset):
 
 
 def test_quality_payload_aligns_with_platform_whitelist(dataset):
-    payload = _call('customer_dataset_quality', dataset)
+    payload = _call('quality', dataset)
     assert payload["row_count"] == 3
     assert payload["pk_declared"] is True
     assert payload["pk_uniqueness"]["unique_ratio"] == 1.0
@@ -190,7 +190,7 @@ def test_empty_dataset_vacuous(dataset):
     with _tools() as mod:
         mod.create_declared("qempty", columns=[{"name": "a", "type": "TEXT"}])
     payload = _call(
-        "customer_dataset_check",
+        "check",
         "qempty", [{"kind": "regex", "column": "a", "pattern": r"^x$"}]
     )
     (result,) = _results(payload)
