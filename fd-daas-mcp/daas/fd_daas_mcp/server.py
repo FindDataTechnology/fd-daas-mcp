@@ -121,6 +121,34 @@ def _register_tools(profile: str | None) -> None:
     )
 
 
+def _session_idle_timeout() -> float:
+    """Idle Streamable-HTTP session timeout in seconds (env-overridable).
+
+    Background (production incident, 2026-10-13/14): sessions accumulated to
+    the mcp SDK's hard cap of 10_000 and every new session was refused
+    ("Refusing to open a new session") — three MCP servers hit it on the same
+    day. Root cause here (fastmcp 4.0.11): its session-manager subclass declares
+    ``session_idle_timeout: float | None = None`` and passes it *explicitly* to
+    the SDK, overriding the SDK's own 1800s default; nothing ever reaps idle
+    sessions. Empirically: 3383 sessions created in 26h with zero "idle timeout"
+    log lines. The same class of bug prompted a `setdefault` patch in
+    fd-open-data-mcp, which is a no-op against an explicitly-passed key.
+    This module therefore passes the timeout explicitly at construction.
+
+    Override with MCP_SESSION_IDLE_TIMEOUT (seconds); 0 or negative keeps the
+    SDK default (None = reaping disabled — only for debugging).
+    """
+    raw = os.environ.get("MCP_SESSION_IDLE_TIMEOUT", "1800").strip() or "1800"
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "MCP_SESSION_IDLE_TIMEOUT=%r is not a number; using 1800", raw
+        )
+        return 1800.0
+    return value if value > 0 else 0.0
+
+
 def main(transport=None, host=None, port=None, profile=None) -> None:
     """Run the fd-daas-mcp server.
 
@@ -152,14 +180,67 @@ def main(transport=None, host=None, port=None, profile=None) -> None:
     if port is None:
         port = int(os.environ.get("MCP_PORT", "8311"))
 
+    # Build the ASGI app explicitly (never app.run(transport="http")): fastmcp
+    # 4.0.11's run_http_async exposes no idle-timeout knob, and its default
+    # leaves idle session reaping OFF (see _session_idle_timeout docstring).
+    import uvicorn
+
+    timeout = _session_idle_timeout()
     token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
-    if not token:
-        app.run(transport="http", host=host, port=port)
+    middleware = [Middleware(BearerAuthMiddleware)] if token else None
+    asgi = _build_http_app(middleware, timeout)
+    logger.info(
+        "Streamable HTTP serving on %s:%s (session_idle_timeout=%ss)",
+        host, port, timeout or "SDK default",
+    )
+    uvicorn.run(asgi, host=host, port=port)
+
+
+def _build_http_app(middleware, timeout: float):
+    """``app.http_app(...)`` with the idle timeout passed only when supported.
+
+    ``session_idle_timeout`` was added to ``FastMCP.http_app`` after 3.4.x;
+    the repo pins ``fastmcp>=3.4.2`` so both shapes occur (local venv 3.4.4,
+    production 4.0.11). Passing it unconditionally would TypeError on 3.4.x;
+    skipping it on a version that needs it is exactly the bug being fixed.
+    """
+    import inspect
+
+    kwargs = {"session_idle_timeout": timeout or None}
+    params = inspect.signature(app.http_app).parameters
+    if "session_idle_timeout" not in params:
+        # fastmcp < 4: no per-call knob — patch the manager subclass the same
+        # way fd-open-data-mcp does, but with an assignment (not setdefault:
+        # the subclass passes the key explicitly, so setdefault never fires —
+        # the very trap that let production accumulate 3383 sessions).
+        _patch_legacy_session_timeout(timeout)
+        kwargs = {}
+    if middleware:
+        kwargs["middleware"] = middleware
+    return app.http_app(**kwargs)
+
+
+def _patch_legacy_session_timeout(timeout: float) -> None:
+    """fastmcp <4 fallback: force an idle timeout on every session manager.
+
+    Runs once per process; a no-op when timeout<=0 (debug escape hatch).
+    """
+    if timeout <= 0:
+        return
+    try:
+        from fastmcp.server.http import FastMCPStreamableHTTPSessionManager
+    except Exception:  # noqa: BLE001 - shape differs across versions
+        return
+    origin = FastMCPStreamableHTTPSessionManager.__init__
+    if getattr(origin, "_fd_daas_idle_patch", False):
         return
 
-    import uvicorn
-    asgi = app.http_app(middleware=[Middleware(BearerAuthMiddleware)])
-    uvicorn.run(asgi, host=host, port=port)
+    def _init(self, *args, **kwargs):
+        kwargs["session_idle_timeout"] = timeout  # assignment, not setdefault
+        origin(self, *args, **kwargs)
+
+    _init._fd_daas_idle_patch = True
+    FastMCPStreamableHTTPSessionManager.__init__ = _init
 
 
 def _run_cli() -> None:
