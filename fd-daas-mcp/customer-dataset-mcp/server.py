@@ -12,6 +12,8 @@ from fastmcp import FastMCP
 app = FastMCP(name="customer-dataset-mcp")
 
 from customer_dataset_tools import (
+    customer_dataset_check,
+    customer_dataset_quality,
     ingest_begin,
     ingest_chunk,
     ingest_commit,
@@ -60,6 +62,9 @@ app.tool(lineage)
 app.tool(delete)
 app.tool(provenance_wal_pending)
 app.tool(provenance_wal_ack)
+# 质量计算体（openspec: wire-quality-rules-v2）
+app.tool(customer_dataset_check)
+app.tool(customer_dataset_quality)
 
 if __name__ == "__main__":
     app.run(transport="stdio", show_banner=False)

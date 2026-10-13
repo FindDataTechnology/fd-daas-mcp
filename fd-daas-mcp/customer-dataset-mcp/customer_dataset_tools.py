@@ -51,6 +51,9 @@ import sqlite3
 import sys
 import time
 import uuid
+
+import pandas
+import regex  # 内容代检查的确定性超时执行面（stdlib re 对灾难回溯无上界）
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2913,5 +2916,416 @@ def provenance_wal_ack(upto_seq: int) -> dict:
                 (int(upto_seq),),
             )
             return {"acked": int(cur.rowcount)}
+    except Exception as e:
+        return _err(e)
+
+# ══════════════════════════════════════════════════════════════════════
+# 质量计算体（openspec: wire-quality-rules-v2）——pandera 检查库在引擎进程内
+# 执行（开源检查库承载检查语义，不自研；数据不出 cell）；返回面只有聚合
+# 计数——失败样本（违规值/行号）在引擎内聚合后丢弃，绝不回传。
+#
+# 两条通道：
+#  - customer_dataset_check：内容代检查（regex / col_compare / range），
+#    一次调用批量多检查（≤5 条/批）；pattern 执行用 regex 库带确定性
+#    timeout（stdlib re 对灾难回溯无上界——对照实验 (x+x+)+y 34 字符
+#    >2min 未完成，regex 库毫秒级）；
+#  - customer_dataset_quality：快照聚合输出，payload 形状与平台侧
+#    _sanitize_null_rates 白名单逐字段对齐（row_count/computed_at/
+#    pk_declared/pk_uniqueness{columns,unique_ratio}/null_rates[]/
+#    sample_limit_hit）。
+#
+# pandera 惰性导入：模块在未装 pandera 的镜像里仍可导入（旧 cell 的
+# 其他工具不受影响）；调用内容代检查时才要求执行体在场，缺失时诚实
+# 报错（"引擎暂不支持该检查类型"）。
+# ══════════════════════════════════════════════════════════════════════
+
+#: 内容代检查 kind 封闭枚举（引擎侧同值域）
+_CHECK_KINDS = frozenset({"regex", "col_compare", "range"})
+#: col_compare 六比较符（含 ne，与 query 过滤算子面 _QUERY_OPS 对齐）
+_COL_COMPARE_OPS = frozenset({"eq", "ne", "gt", "gte", "lt", "lte"})
+#: pattern 编译闸：长度上限 + 灾难回溯构造粗检（量词嵌套）
+_PATTERN_MAX_LEN = 128
+_PATTERN_NESTED_QUANT = re.compile(r"\([^()]*[+*][^()]*\)[+*]")
+#: 单值 regex 执行超时（秒）——regex 库硬闸（任一值超时即中止该检查）
+_PATTERN_TIMEOUT_S = 2.0
+#: 质量快照的抽样行数上限（与平台侧 spec「抽样行数上限 10000」对齐）
+_QUALITY_SAMPLE_LIMIT = 10_000
+#: 检查内中止（超时/类型错误/异常）的哨兵——pandera 会把检查内异常收进
+#: failure_cases（裸用会把「执行失败」误报成「数据不合格」，违反诚实纪律）；
+#: 每道检查谓词统一包 try/except 转哨兵，事后按哨兵把该检查落 error。
+_CHECK_ABORTED_SENTINEL = "__CHECK_ABORTED__"
+
+
+class CustomerDatasetCheckAborted(RuntimeError):
+    """检查执行被中止（超时/求值异常）——落 error，绝不误报数据不合格。"""
+
+
+def _pandera():
+    """惰性导入 pandera（旧镜像无此依赖时模块仍可导入）。"""
+    try:
+        import pandera.pandas as pa  # noqa: PLC0415
+        from pandera import Check  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - 镜像缺依赖面
+        raise CustomerDatasetError(
+            "内容代检查执行体未安装（pandera 缺失）——引擎暂不支持该检查类型，"
+            "请升级 cell 镜像"
+        ) from exc
+    return pa, Check
+
+
+def _validate_pattern(pattern: str) -> "regex.Pattern":
+    """pattern 编译闸（引擎侧二道防线；平台侧同款先行校验）。
+
+    长度 ≤128；拒绝量词嵌套构造（灾难回溯形态）；regex 库预编译失败即拒。
+    """
+    if not isinstance(pattern, str) or not pattern:
+        raise CustomerDatasetError("pattern 不能为空")
+    if len(pattern) > _PATTERN_MAX_LEN:
+        raise CustomerDatasetError(f"pattern 过长（>{_PATTERN_MAX_LEN} 字符）")
+    if _PATTERN_NESTED_QUANT.search(pattern):
+        raise CustomerDatasetError("pattern 含嵌套量词构造（灾难回溯风险），拒绝执行")
+    try:
+        return regex.compile(pattern)
+    except regex.error as exc:
+        raise CustomerDatasetError(f"pattern 编译失败: {exc}") from exc
+
+
+def _guard(predicate):
+    """谓词统一包哨兵：检查内任何异常（含超时）→ CheckAborted 哨兵。
+
+    pandera 在 lazy 模式把检查内异常收进 failure_cases 而不中断整批——
+    哨兵让事后归因能区分「数据不合格」与「检查执行失败」。
+    """
+
+    def inner(frame_or_series):
+        try:
+            return predicate(frame_or_series)
+        except CustomerDatasetCheckAborted:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 一律转哨兵
+            raise CustomerDatasetCheckAborted(
+                f"{_CHECK_ABORTED_SENTINEL}{type(exc).__name__}: {exc}"
+            ) from exc
+
+    return inner
+
+
+def _load_frame(dataset_key: str, columns: list):
+    """读有效表（含修正 overlay）到 DataFrame——pandera 的进程内执行面。
+
+    数据只在本进程内存里（cell 内），绝不外传。全量载入与 derive/
+    materialize 的既有引擎行为包络一致（cell 数据根为单客户独享）。
+    """
+    import pandas  # noqa: PLC0415 - 惰性（引擎另有 sqlite 轻路径）
+
+    table = _table_name(dataset_key)
+    collist = ", ".join(_quote(c) for c in columns)
+    sql = f"SELECT {collist} FROM {_quote(table)}"
+    with get_database().engine.connect() as conn:
+        frame = pandas.read_sql_query(sql, conn)
+    # 空表也要保住列结构（pandera 空真路径的依据）
+    for c in columns:
+        if c not in frame.columns:
+            frame[c] = None
+    return frame
+
+
+def _regex_predicate(compiled: "regex.Pattern"):
+    """元素级 regex 谓词：True=pass。NULL 不计违规（空值另有 null 检查）。"""
+    import pandas  # noqa: PLC0415
+
+    def predicate(series):
+        mask_null = series.isna()
+
+        def _match(value):
+            try:
+                return bool(
+                    compiled.fullmatch(str(value), timeout=_PATTERN_TIMEOUT_S)
+                )
+            except TimeoutError as exc:
+                raise CustomerDatasetCheckAborted(
+                    f"{_CHECK_ABORTED_SENTINEL}pattern 执行超时（>{_PATTERN_TIMEOUT_S}s）"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - 序列化/类型异常同哨兵
+                raise CustomerDatasetCheckAborted(
+                    f"{_CHECK_ABORTED_SENTINEL}{type(exc).__name__}: {exc}"
+                ) from exc
+
+        matched = series.map(_match)
+        return pandas.Series(mask_null | matched, index=series.index)
+
+    return predicate
+
+
+def _col_compare_predicate(col_a: str, op: str, col_b: str):
+    """Frame 级跨列谓词：True=pass。任一侧 NULL 不算违规。"""
+    def predicate(frame):
+        a, b = frame[col_a], frame[col_b]
+        both = a.notna() & b.notna()
+        cmp = {
+            "eq": lambda: a == b,
+            "ne": lambda: a != b,
+            "gt": lambda: a > b,
+            "gte": lambda: a >= b,
+            "lt": lambda: a < b,
+            "lte": lambda: a <= b,
+        }[op]()
+        # 语义：仅「任一侧为空」的行豁免（缺失由 null 类检查盯）；
+        # 两侧都有值必须满足比较 —— (~both) | cmp，不是 both | cmp。
+        return (~both) | cmp.fillna(False)
+
+    return predicate
+
+
+def _range_predicate(column: str, lo, hi):
+    """元素级区间谓词（闭区间）：True=pass。NULL 与非数值不计违规之外的坑
+    ——非数值（无法比较）计违规（数据不合格的如实形态）。"""
+    import pandas  # noqa: PLC0415
+
+    def predicate(series):
+        mask_null = series.isna()
+        numeric = pandas.to_numeric(series, errors="coerce")
+        ok = numeric.notna()
+        if lo is not None:
+            ok &= numeric >= float(lo)
+        if hi is not None:
+            ok &= numeric <= float(hi)
+        return mask_null | ok
+
+    return predicate
+
+
+def _run_check_batch(dataset_key: str, checks: list, columns: list) -> dict:
+    """批量内容代检查：pandera schema 一次 validate（≤5 条/批）。
+
+    返回逐检查 GX 式契约。**失败样本只在本地聚合计数后丢弃**——
+    返回体不含任何数据值（红线 2 的引擎返回面对偶约束）。
+    """
+    if not isinstance(checks, list) or not checks:
+        raise CustomerDatasetError("checks 不能为空")
+    if len(checks) > 5:
+        raise CustomerDatasetError(f"单次调用至多 5 条检查（收到 {len(checks)}）")
+    pa, Check = _pandera()
+
+    frame = _load_frame(dataset_key, columns)
+    element_count = int(len(frame))
+
+    # 规格先全部校验（关：非法 spec 整批拒，不假执行）
+    specs: list[tuple[str, str, dict]] = []  # (name, kind, spec)
+    column_checks: dict[str, list] = {}
+    frame_checks: list = []
+    spec_errors: dict[str, str] = {}
+    for idx, spec in enumerate(checks):
+        name = f"chk{idx}"
+        kind = str((spec or {}).get("kind", "")).lower()
+        specs.append((name, kind, spec or {}))
+        try:
+            if kind == "regex":
+                column = (spec or {}).get("column")
+                if column not in frame.columns:
+                    raise CustomerDatasetError(f"检查列不存在: {column!r}")
+                compiled = _validate_pattern((spec or {}).get("pattern"))
+                column_checks.setdefault(column, []).append(
+                    Check(_guard(_regex_predicate(compiled)), name=name)
+                )
+            elif kind == "col_compare":
+                col_a = (spec or {}).get("col_a")
+                col_b = (spec or {}).get("col_b")
+                op = str((spec or {}).get("op", "")).lower()
+                if op not in _COL_COMPARE_OPS:
+                    raise CustomerDatasetError(
+                        f"col_compare 非法操作符 {op!r}（允许 {sorted(_COL_COMPARE_OPS)}）"
+                    )
+                for cname in (col_a, col_b):
+                    if cname not in frame.columns:
+                        raise CustomerDatasetError(f"检查列不存在: {cname!r}")
+                if col_a == col_b:
+                    raise CustomerDatasetError("col_compare 两侧不能是同一列")
+                frame_checks.append(
+                    Check(_guard(_col_compare_predicate(col_a, op, col_b)), name=name)
+                )
+            elif kind == "range":
+                column = (spec or {}).get("column")
+                if column not in frame.columns:
+                    raise CustomerDatasetError(f"检查列不存在: {column!r}")
+                lo, hi = (spec or {}).get("min"), (spec or {}).get("max")
+                if lo is None and hi is None:
+                    raise CustomerDatasetError("range 至少给 min 或 max 之一")
+                if lo is not None and hi is not None and float(lo) > float(hi):
+                    raise CustomerDatasetError("range 的 min 不能大于 max")
+                column_checks.setdefault(column, []).append(
+                    Check(_guard(_range_predicate(column, lo, hi)), name=name)
+                )
+            else:
+                raise CustomerDatasetError(
+                    f"未知检查类型 {kind!r}（允许 {sorted(_CHECK_KINDS)}）"
+                )
+        except CustomerDatasetError as exc:
+            spec_errors[name] = str(exc)
+
+    def _err_result(message: str) -> dict:
+        return {
+            "status": "error",
+            "element_count": element_count,
+            "unexpected_count": None,
+            "pass_rate": None,
+            "error": message,
+        }
+
+    # 组装 schema（只含校验通过的判据）
+    schema = pa.DataFrameSchema(
+        {
+            col: pa.Column(nullable=True, checks=cks)
+            for col, cks in column_checks.items()
+        },
+        checks=frame_checks or None,
+        coerce=False,
+    )
+
+    aborted: dict[str, str] = {}
+    violations: dict[str, int] = {}
+    if column_checks or frame_checks:
+        try:
+            schema.validate(frame, lazy=True)
+        except pa.errors.SchemaErrors as exc:
+            fc = exc.failure_cases
+            for name, _kind, _spec in specs:
+                if name in spec_errors:
+                    continue
+                rows = fc[fc["check"] == name]
+                if len(rows) == 0:
+                    continue
+                sentinel_rows = rows[
+                    rows["failure_case"].astype(str).str.contains(
+                        _CHECK_ABORTED_SENTINEL, regex=False
+                    )
+                ]
+                if len(sentinel_rows):
+                    raw = str(sentinel_rows["failure_case"].iloc[0])
+                    reason = raw.split(_CHECK_ABORTED_SENTINEL, 1)[-1].rstrip('")')
+                    aborted[name] = reason or "检查执行失败"
+                real = rows[
+                    ~rows["failure_case"].astype(str).str.contains(
+                        _CHECK_ABORTED_SENTINEL, regex=False
+                    )
+                ]
+                if len(real):
+                    # 跨列失败行会双列归因——按行去重计数
+                    violations[name] = int(real["index"].nunique())
+
+    results: list[dict] = []
+    for name, _kind, _spec in specs:
+        if name in spec_errors:
+            results.append(_err_result(spec_errors[name]))
+            continue
+        if name in aborted:
+            results.append(_err_result(f"检查执行中止：{aborted[name]}"))
+            continue
+        n = violations.get(name, 0)
+        pass_rate = 1.0 - (n / element_count) if element_count else 1.0
+        results.append({
+            "status": "pass" if n == 0 else "fail",
+            "element_count": element_count,
+            "unexpected_count": n,
+            "pass_rate": round(pass_rate, 6),
+        })
+    return {"results": results, "element_count": element_count}
+
+
+def customer_dataset_check(dataset_key: str, checks: list) -> dict:
+    """Batch content-level checks over a customer dataset
+    (openspec: wire-quality-rules-v2). Each check: {kind, ...}:
+    - regex: {kind: "regex", column, pattern} — pattern length ≤128, no
+      nested quantifiers, executed with a deterministic timeout (regex lib);
+    - col_compare: {kind: "col_compare", col_a, op, col_b} — ops:
+      eq/ne/gt/gte/lt/lte;
+    - range: {kind: "range", column, min?/max?} — closed interval, at least
+      one bound.
+
+    At most 5 checks per call. Returns per-check Great-Expectations-style
+    outcome {status: pass|fail|error, element_count, unexpected_count,
+    pass_rate}. NULL values never count as violations (null coverage is a
+    separate concern); an empty dataset passes vacuously. A check whose own
+    execution fails (e.g. regex timeout) reports `error`, never `fail`.
+    Failure samples (offending values / row indexes) are aggregated to
+    counts inside the engine and discarded — the response contains no data
+    values.
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+        checks: List of check specs (≤5 per call).
+    """
+    try:
+        dataset_key = _validate_key(dataset_key)
+        meta = _svc()._meta(dataset_key)
+        columns = [c["name"] for c in (meta.columns_json or [])]
+        return _ok(_run_check_batch(dataset_key, checks, columns))
+    except Exception as e:
+        return _err(e)
+
+
+def customer_dataset_quality(dataset_key: str) -> dict:
+    """Quality snapshot aggregates for one dataset (openspec:
+    wire-quality-rules-v2; payload shape aligned field-by-field with the
+    platform-side sanitizer). Returns {row_count, computed_at, pk_declared,
+    pk_uniqueness: {columns, unique_ratio} | null, null_rates: [{column,
+    null_rate, sampled_rows}], sample_limit_hit}. Only aggregate counts and
+    ratios — never data values.
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+    """
+    try:
+        dataset_key = _validate_key(dataset_key)
+        meta = _svc()._meta(dataset_key)
+        columns = [c["name"] for c in (meta.columns_json or [])]
+        pk_columns = list(meta.pk_columns_json or [])
+        table = _table_name(dataset_key)
+
+        row_count = int(_raw_query_one(f"SELECT COUNT(*) FROM {_quote(table)}")[0])
+
+        pk_declared = bool(pk_columns)
+        unique_ratio = None
+        if pk_declared and row_count:
+            collist = ", ".join(_quote(c) for c in pk_columns)
+            distinct = int(
+                _raw_query_one(
+                    f"SELECT COUNT(*) FROM (SELECT DISTINCT {collist}"
+                    f" FROM {_quote(table)}) AS _d"
+                )[0]
+            )
+            unique_ratio = round(distinct / row_count, 6)
+
+        # null_rates：抽样上限内计数（与平台 spec 口径一致）
+        null_rates: list[dict] = []
+        sampled_rows = min(row_count, _QUALITY_SAMPLE_LIMIT)
+        if row_count and columns:
+            parts = ", ".join(
+                f"SUM(CASE WHEN {_quote(c)} IS NULL THEN 1 ELSE 0 END)"
+                for c in columns
+            )
+            row = _raw_query_one(
+                f"SELECT {parts} FROM (SELECT * FROM {_quote(table)} LIMIT ?) AS _s",
+                (int(sampled_rows),),
+            )
+            for i, c in enumerate(columns):
+                n = int(row[i] or 0)
+                null_rates.append({
+                    "column": c,
+                    "null_rate": round(n / sampled_rows, 6) if sampled_rows else None,
+                    "sampled_rows": sampled_rows,
+                })
+
+        return _ok({
+            "row_count": row_count,
+            "computed_at": _now_db(),
+            "pk_declared": pk_declared,
+            "pk_uniqueness": (
+                {"columns": pk_columns, "unique_ratio": unique_ratio}
+                if pk_declared else None
+            ),
+            "null_rates": null_rates,
+            "sample_limit_hit": row_count > _QUALITY_SAMPLE_LIMIT,
+        })
     except Exception as e:
         return _err(e)
