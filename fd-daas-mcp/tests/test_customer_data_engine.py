@@ -561,7 +561,8 @@ class TestDerive:
     def test_tool_surface_selfcheck_cell_profile(self):
         result = selfcheck.run_invariants(profile="cell")
         assert result["ok"] is True, result
-        assert result["group_counts"]["customer_dataset"] == 23
+        # 23 已随工具面扩张静默腐烂（实际 25→31，见 test_profiles 同款注释）
+        assert result["group_counts"]["customer_dataset"] == 31
 
 
 # ── section 4: join_indicators ───────────────────────────────────────

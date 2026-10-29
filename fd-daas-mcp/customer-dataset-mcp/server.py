@@ -35,6 +35,15 @@ from customer_dataset_tools import (
     derive_refresh,
     lineage,
     delete,
+    # 确定性算子 + SQL 步骤（wire-transform-operators）：物化型算子与只读
+    # 试运行分开注册——aggregate_derive 是**物化**聚合（aggregate 已是只读
+    # 面板查询，同名会撞车），sql/sql_preview 分别是物化与预览。
+    filter,
+    project,
+    aggregate_derive,
+    union,
+    sql,
+    sql_preview,
     provenance_wal_pending,
     provenance_wal_ack,
 )
@@ -60,6 +69,12 @@ app.tool(link)
 app.tool(derive_refresh)
 app.tool(lineage)
 app.tool(delete)
+app.tool(filter)
+app.tool(project)
+app.tool(aggregate_derive)
+app.tool(union)
+app.tool(sql)
+app.tool(sql_preview)
 app.tool(provenance_wal_pending)
 app.tool(provenance_wal_ack)
 # 质量计算体（openspec: wire-quality-rules-v2）——函数短名：group 名
