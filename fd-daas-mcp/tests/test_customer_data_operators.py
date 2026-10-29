@@ -28,6 +28,22 @@ sys.path.remove(str(_DAAS_MCP))
 
 from daas.fd_daas_mcp import registry  # noqa: E402
 
+import conftest  # noqa: E402
+
+# SQL 步骤的第二/三层护栏（授权回调 + 只读连接）是 SQLite 专属：PG 数据根上
+# 引擎 fail-closed（见 customer_dataset_tools._run_sql_readonly 的 D7 边界）。
+# 因此「需要 SQL 真跑起来」的用例只在 sqlite 腿声明；而「文本层就该拒掉」的
+# 用例（未声明占位/多余声明/危险语句）在**两腿都跑**——文本层先于执行器触发，
+# 与后端无关，正好证明第一层护栏跨方言一致。
+requires_sqlite = pytest.mark.skipif(
+    conftest.TEST_BACKEND != "sqlite",
+    reason="SQL 执行（物化/预览/重放）依赖 SQLite 授权回调护栏；PG 腿按设计 fail-closed",
+)
+requires_pg = pytest.mark.skipif(
+    conftest.TEST_BACKEND != "postgres",
+    reason="验证 PG 数据根 SQL fail-closed（仅 PG 腿）",
+)
+
 _COLS = [
     {"name": "id", "type": "INTEGER"},
     {"name": "region", "type": "TEXT"},
@@ -448,6 +464,7 @@ class TestUnion:
 
 
 class TestSql:
+    @requires_sqlite
     def test_legal_sql_with_placeholder_materializes(self):
         src = _key("ssrc")
         _seed(src)
@@ -517,6 +534,7 @@ class TestSql:
         assert needle in r["error"], r["error"]
         assert not _exists(child), "护栏拒收时不得产生任何数据集"
 
+    @requires_sqlite
     def test_authorizer_blocks_undeclared_real_table(self):
         """绕过文本层直接引用真实表名：授权回调结构性拒绝。"""
         src = _key("ssrc")
@@ -532,6 +550,7 @@ class TestSql:
         assert "error" in r, r
         assert not _exists(children)
 
+    @requires_sqlite
     def test_literal_params_bound_not_concatenated(self):
         src = _key("ssrc")
         _seed(src)
@@ -545,6 +564,7 @@ class TestSql:
         assert "error" not in r, r
         assert r["rows"] == 2
 
+    @requires_sqlite
     def test_sql_step_refresh_replays(self):
         src = _key("ssrc")
         _seed(src)
@@ -560,6 +580,7 @@ class TestSql:
         rows = _query(child)["rows"]  # query 行带引擎行锚 __row_id
         assert [x["n"] for x in rows] == [6]
 
+    @requires_sqlite
     def test_preview_creates_nothing(self):
         src = _key("ssrc")
         _seed(src)
@@ -576,6 +597,7 @@ class TestSql:
         # 绝不落数据集：父集行数不变、且没有新数据集出现
         assert _t()["customer_dataset_overview"](dataset_key=src)["rows"] == before
 
+    @requires_sqlite
     def test_preview_caps_at_100(self):
         src = _key("ssrc")
         _seed(src, rows=[{"id": i, "region": "r", "amount": 1.0, "note": "n"} for i in range(150)])
@@ -594,6 +616,7 @@ class TestSql:
         )
         assert "error" in r and "DELETE" in r["error"]
 
+    @requires_sqlite
     def test_comments_do_not_trip_blacklist(self):
         """注释里出现 DROP TABLE 不该误伤（真语句本身是只读 SELECT）。"""
         src = _key("ssrc")
@@ -609,6 +632,7 @@ class TestSql:
         assert r["rows"] == 1
         assert [x["n"] for x in _query(child)["rows"]] == [5]
 
+    @requires_sqlite
     def test_cte_query_allowed(self):
         src = _key("ssrc")
         _seed(src)
@@ -624,6 +648,7 @@ class TestSql:
         assert "error" not in r, r
         assert r["rows"] == 3
 
+    @requires_sqlite
     def test_multiple_placeholders(self):
         left = _key("ssrc")
         right = _key("sother")
@@ -654,8 +679,41 @@ def test_capabilities_advertise_new_operators():
     src = _key("caps")
     _seed(src)
     caps = _t()["customer_dataset_overview"](dataset_key=src)["capabilities"]
-    for key in ("filter", "project", "aggregate_derive", "union", "sql"):
+    # 四算子走引擎声明列 SQL（_tx 的方言光标），两腿都 advertised True。
+    for key in ("filter", "project", "aggregate_derive", "union"):
         assert caps.get(key) is True, key
+    # SQL 能力位按后端诚实：sqlite 腿 advertised True；PG 腿 fail-closed→False
+    # （引擎不 advertised 一个跑不动的能力骗调用方做注定失败的往返）。按「腿」
+    # 断言而非运行时 db_dialect.is_postgres()——后者读 get_database 引擎单例，
+    # 整-suite 跑时会被前序测试的引擎缓存态影响（单跑过、全跑翻车的顺序依赖）。
+    assert caps.get("sql") is (conftest.TEST_BACKEND != "postgres"), "sql"
+
+
+@requires_pg
+def test_sql_fail_closed_on_postgres():
+    """PG 数据根：SQL 步骤/试运行 fail-closed，且不产生任何数据集。
+
+    D7 边界的契约测试——护栏的第二/三层（授权回调 + 只读连接）是 SQLite 专属，
+    PG 上无等价结构性拒绝，引擎据「不泄露其它数据集/目录」红线 fail-closed；
+    能力位同步报 sql:False（见 test_capabilities_advertise_new_operators）。
+    """
+    src = _key("pgsrc")
+    _seed(src)
+    child = _key("pgout")
+    r = _t()["customer_dataset_sql"](
+        child_key=child,
+        sql="SELECT * FROM {orders}",
+        tables=[{"name": "orders", "dataset_key": src}],
+    )
+    assert "error" in r, r
+    assert "PostgreSQL" in r["error"] and "暂不开放" in r["error"], r["error"]
+    assert not _exists(child)
+    # 试运行同样 fail-closed（绝不在 PG 上开一条没护栏的只读口子）
+    pv = _t()["customer_dataset_sql_preview"](
+        sql="SELECT * FROM {orders}",
+        tables=[{"name": "orders", "dataset_key": src}],
+    )
+    assert "error" in pv and "PostgreSQL" in pv["error"], pv
 
 
 # ── 4.1 真库冒烟：filter→aggregate 链 + SQL 步骤 + 试运行 ─────────────
@@ -692,6 +750,7 @@ def test_smoke_filter_then_aggregate_chain() -> None:
     assert rows == {"华北": 2, "华南": 1}
 
 
+@requires_sqlite
 def test_smoke_sql_step_then_preview() -> None:
     """真 SQLite 上跑 SQL 步骤物化 + 试运行（预览零副作用）。"""
     t = _t()

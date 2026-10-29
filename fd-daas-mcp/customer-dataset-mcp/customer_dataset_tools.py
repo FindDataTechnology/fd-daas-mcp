@@ -659,7 +659,21 @@ def _run_sql_readonly(
     物化路径（``truncate=False``）整批超上限即拒绝——绝不静默截断；试运行
     （``truncate=True``）按 spec 的「强制 LIMIT 100 预览」语义截断，并把
     ``truncated`` 如实回传给调用方展示。
+
+    后端边界（如实 fail-closed，openspec: wire-transform-operators D7）：第二、
+    三层护栏（只读连接 + 按声明表结构性放行、跨表/目录读取 DENY）建在 SQLite
+    授权回调上，PostgreSQL 无等价机制——裸 ``SELECT`` 即便只读也能触到
+    ``pg_database``/未声明表，泄露同库其它数据集与集群目录信息。故 PG 数据根的
+    SQL 步骤 fail-closed 拒绝（filter/project/aggregate_derive/union 四算子经
+    引擎自身声明列 SQL 执行，不受影响）。
     """
+    if db_dialect.is_postgres():
+        raise CustomerDatasetError(
+            "SQL 步骤在 PostgreSQL 数据根暂不开放：只读护栏依赖 SQLite 授权回调"
+            "（按声明表放行、跨表/目录读取拒绝），PG 无等价机制，放开会泄露同库"
+            "其它数据集与目录信息——为不越「不泄露用户数据」红线而 fail-closed。"
+            "filter/project/aggregate/union 四算子不受影响。"
+        )
     bound = _substitute_sql(sql_text, mapping)
     allowed = {_table_name(key).lower() for key in mapping.values()}
     # CTE 名不是真实表，但部分 sqlite 版本会把它们报进授权回调的 READ
@@ -1474,7 +1488,13 @@ class CustomerDatasetService:
 
     def overview(self, dataset_key: str) -> dict:
         meta = self._meta(_validate_key(dataset_key))
-        out = {**meta.to_dict(), "capabilities": dict(ENGINE_CAPABILITIES)}
+        capabilities = dict(ENGINE_CAPABILITIES)
+        # SQL 步骤只读护栏建在 SQLite 授权回调上（见 _run_sql_readonly D7），PG
+        # 数据根 fail-closed——能力位如实反映后端，api/前端据此诚实降级，绝不在
+        # PG cell 上 advertised sql:True 再把调用方骗到一次注定失败的往返。
+        if db_dialect.is_postgres():
+            capabilities["sql"] = False
+        out = {**meta.to_dict(), "capabilities": capabilities}
         # storage-quota observability (wire-cell-storage-quota): the two
         # fields appear ONLY when the quota is armed AND the backend is
         # PostgreSQL — otherwise the response shape is unchanged. This is a
@@ -2696,8 +2716,8 @@ class CustomerDatasetService:
             ).fetchone()
             if parent_meta is None:
                 raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
-            parent_columns = json.loads(parent_meta[0]) if parent_meta[0] else []
-            parent_pk = list(json.loads(parent_meta[1])) if parent_meta[1] else []
+            parent_columns = _json_col(parent_meta[0]) or []
+            parent_pk = list(_json_col(parent_meta[1])) if parent_meta[1] else []
             types = {c["name"]: c["type"] for c in parent_columns}
             out_columns: list[dict] = []
             seen: set[str] = set()
@@ -2826,7 +2846,7 @@ class CustomerDatasetService:
             ).fetchone()
             if meta is None:
                 raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
-            parent_columns = json.loads(meta[0]) if meta[0] else []
+            parent_columns = _json_col(meta[0]) or []
             col_types = {
                 c["name"]: str(c.get("type", "TEXT")).upper() for c in parent_columns
             }
@@ -2887,7 +2907,7 @@ class CustomerDatasetService:
                 ).fetchone()
                 if meta is None:
                     raise CustomerDatasetError(f"数据集不存在: {key!r}")
-                columns = json.loads(meta[0]) if meta[0] else []
+                columns = _json_col(meta[0]) or []
                 names = [c["name"] for c in columns]
                 raw = cur.execute(
                     f"SELECT {', '.join(_quote(n) for n in names)}"
