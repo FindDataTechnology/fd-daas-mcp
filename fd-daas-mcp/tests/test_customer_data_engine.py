@@ -561,7 +561,10 @@ class TestDerive:
     def test_tool_surface_selfcheck_cell_profile(self):
         result = selfcheck.run_invariants(profile="cell")
         assert result["ok"] is True, result
-        # 23 已随工具面扩张静默腐烂（实际 25→31，见 test_profiles 同款注释）
+        # 22 tools + quality (wire-asset-catalog §3 read-only quality snapshot)
+        # + link (wire-transform-pipelines §1: LEFT-JOIN materializer)
+        # + filter/project/aggregate_derive/union/sql/sql_preview
+        # (wire-transform-operators) + window (wire-window-operator) = 31.
         assert result["group_counts"]["customer_dataset"] == 31
 
 

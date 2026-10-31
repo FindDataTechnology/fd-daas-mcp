@@ -105,6 +105,26 @@ QUERY_TIMEOUT_S = 5.0
 OPERATOR_MAX_GROUP_BY = 10
 OPERATOR_MAX_MEASURES = 20
 
+# ── window operator (wire-window-operator D1/D2) ─────────────────────
+#: 分区列 / 排序列 / 窗口行个数上限（design D1：partition_by 0..10、
+#: order_by 0..10、window 1..20）
+WINDOW_MAX_PARTITION_BY = 10
+WINDOW_MAX_ORDER_BY = 10
+WINDOW_MAX_ROWS = 20
+#: lag/lead 位移上限（防病态：10 万行偏移 = 逐行回溯的病态代价）
+WINDOW_MAX_OFFSET = 10_000
+#: 函数闭集（design D1）——排序类与 lag/lead 必须有 order_by。
+WINDOW_FUNCS = frozenset(
+    {"row_number", "rank", "dense_rank", "lag", "lead", "sum", "avg", "min", "max", "count"}
+)
+WINDOW_RANKING_FUNCS = frozenset({"row_number", "rank", "dense_rank"})
+WINDOW_OFFSET_FUNCS = frozenset({"lag", "lead"})
+WINDOW_AGG_FUNCS = frozenset({"sum", "avg", "min", "max", "count"})
+#: frame 闭集（design D2）：整分区 / 累积到当前行；不开放任意边界语法。
+WINDOW_FRAMES = frozenset({"whole_partition", "running"})
+#: 稳定行键：并列排序的最终 tie-break（design D2），绝不进输出列。
+WINDOW_TIEBREAK_COL = "__row_hash"
+
 # ── SQL step guardrails (wire-transform-operators D3) ────────────────
 #: SQL 文本长度上限（护栏之外的输入尺寸闸——超长文本本身即异常用法）
 SQL_MAX_LENGTH = 20_000
@@ -171,6 +191,9 @@ ENGINE_CAPABILITIES = {
     "aggregate_derive": True,
     "union": True,
     "sql": True,
+    # 窗口算子（wire-window-operator）：旧镜像缺这个键，api 侧据 capability
+    # 探测给出「引擎暂不支持」的如实降级（design D6）。
+    "window": True,
 }
 
 
@@ -3063,6 +3086,271 @@ class CustomerDatasetService:
             "columns": out_names,
         }
 
+    @staticmethod
+    def _window_plan(
+        col_types: dict[str, str], partition_by: list, order_by: list, window: list
+    ) -> tuple[list[str], list[dict], list[dict]]:
+        """窗口计划：校验 + (窗口表达式 SQL, 输出列声明, 归一化 window 行)。
+
+        校验矩阵逐条对应 design D1/D2：partition_by 0..10 列 ⊆ 快照、
+        order_by 0..10 `{column, dir}`、window 1..20 行、函数闭集、排序类与
+        lag/lead 必填 order_by、lag/lead offset 1..10000、聚合类 column 校验
+        （count 允许无 column）、``as`` 必填唯一且不与源列撞名、frame 闭集。
+
+        返回的表达式只含**声明列名**与常量 offset——SQL 文本由引擎构造，
+        没有用户 SQL 文本面（因此在 PG 数据根也不需要 SQL 步骤那条
+        fail-closed 护栏，design D4）。
+        """
+        if not isinstance(partition_by, list):
+            raise CustomerDatasetError("partition_by 必须为数组")
+        if len(partition_by) > WINDOW_MAX_PARTITION_BY:
+            raise CustomerDatasetError(
+                f"分区列数超过上限 {WINDOW_MAX_PARTITION_BY}（当前 {len(partition_by)}）"
+            )
+        if len(set(partition_by)) != len(partition_by):
+            raise CustomerDatasetError(f"分区列重复: {partition_by!r}")
+        for col in partition_by:
+            if not isinstance(col, str) or col not in col_types:
+                raise CustomerDatasetError(f"分区列不存在: {col!r}")
+        if not isinstance(order_by, list):
+            raise CustomerDatasetError("order_by 必须为数组")
+        if len(order_by) > WINDOW_MAX_ORDER_BY:
+            raise CustomerDatasetError(
+                f"排序列数超过上限 {WINDOW_MAX_ORDER_BY}（当前 {len(order_by)}）"
+            )
+        order_parts: list[str] = []
+        order_cols: list[str] = []
+        for item in order_by:
+            if not isinstance(item, dict):
+                raise CustomerDatasetError(f"排序项必须是对象: {item!r}")
+            col = item.get("column")
+            direction = str(item.get("dir", "asc")).lower()
+            if not isinstance(col, str) or col not in col_types:
+                raise CustomerDatasetError(f"排序列不存在: {col!r}")
+            if direction not in ("asc", "desc"):
+                raise CustomerDatasetError(f"非法排序方向: {direction!r}（允许 asc/desc）")
+            if col in order_cols:
+                raise CustomerDatasetError(f"排序列重复: {col!r}")
+            order_cols.append(col)
+            order_parts.append(f"{_quote(col)} {direction.upper()}")
+        # design D2：内部 ORDER BY 末尾追加稳定行键，作并列的最终 tie-break
+        # （重派生逐行一致）。该列只参与排序，绝不进输出列。
+        #
+        # 例外（rank/dense_rank）：它们的语义就是「并列同名次」，把
+        # __row_hash 塞进它们的 OVER ORDER BY 会消灭并列、退化成
+        # row_number。故 rank/dense_rank 用**声明键序**（值本身确定，并列
+        # 行名次相同，无需 tie-break），其余行序敏感函数用键序+行键。
+        keys_order_sql = ", ".join(order_parts)
+        tiebreak_order_sql = ", ".join(
+            order_parts + [f"{_quote(WINDOW_TIEBREAK_COL)} ASC"]
+        )
+        partition_sql = (
+            "PARTITION BY " + ", ".join(_quote(c) for c in partition_by)
+            if partition_by
+            else ""
+        )
+        has_order = bool(order_parts)
+        if not isinstance(window, list) or not window:
+            raise CustomerDatasetError("window 必须为非空数组（[{func, column?, offset?, as}]）")
+        if len(window) > WINDOW_MAX_ROWS:
+            raise CustomerDatasetError(
+                f"窗口行数超过上限 {WINDOW_MAX_ROWS}（当前 {len(window)}）"
+            )
+        out_columns = [{"name": n, "type": t} for n, t in col_types.items()]
+        source_names = set(col_types)
+        seen_as: set[str] = set()
+        exprs: list[str] = []
+        normalized: list[dict] = []
+        for item in window:
+            if not isinstance(item, dict):
+                raise CustomerDatasetError(f"窗口行必须是对象: {item!r}")
+            func = str(item.get("func", "")).lower()
+            if func not in WINDOW_FUNCS:
+                raise CustomerDatasetError(
+                    f"非法窗口函数: {func!r}（允许 {sorted(WINDOW_FUNCS)}）"
+                )
+            alias = item.get("as")
+            if not isinstance(alias, str) or not _COL_RE.match(alias):
+                raise CustomerDatasetError(f"window 行缺少合法输出列名 as: {alias!r}")
+            if alias.startswith(_RESERVED_COL_PREFIX):
+                raise CustomerDatasetError(
+                    f"列名不能使用保留前缀 {_RESERVED_COL_PREFIX!r}: {alias!r}"
+                )
+            if alias in source_names:
+                raise CustomerDatasetError(
+                    f"window 输出列名与源列名冲突: {alias!r}（请换一个 as，不静默改名）"
+                )
+            if alias in seen_as:
+                raise CustomerDatasetError(
+                    f"window 输出列名重复: {alias!r}（每行 as 必须唯一）"
+                )
+            seen_as.add(alias)
+            frame = str(item.get("frame") or "whole_partition").lower()
+            if frame not in WINDOW_FRAMES:
+                raise CustomerDatasetError(
+                    f"非法 frame: {frame!r}（允许 {sorted(WINDOW_FRAMES)}）"
+                )
+            if frame == "running" and not has_order:
+                raise CustomerDatasetError(
+                    "frame=running 需要 order_by（累积帧必须有确定行序）"
+                )
+            col = item.get("column")
+            offset = item.get("offset")
+            normalized.append({"func": func, "column": col, "offset": offset, "as": alias, "frame": frame})
+            if func in WINDOW_RANKING_FUNCS:
+                if col is not None:
+                    raise CustomerDatasetError(f"{func} 不接受 column（它只对行序编号）")
+                if not has_order:
+                    raise CustomerDatasetError(f"{func} 需要 order_by（排序类窗口函数）")
+                expr, out_type = f"{func.upper()}()", "INTEGER"
+                # rank/dense_rank：声明键序（保留并列语义）；row_number：
+                # 键序+行键（并列行的编号确定且可重放）。
+                over_parts = [
+                    partition_sql,
+                    "ORDER BY "
+                    + (
+                        keys_order_sql
+                        if func in ("rank", "dense_rank")
+                        else tiebreak_order_sql
+                    ),
+                ]
+            elif func in WINDOW_OFFSET_FUNCS:
+                if col not in col_types:
+                    raise CustomerDatasetError(f"{func} 的 column 不存在: {col!r}")
+                if not has_order:
+                    raise CustomerDatasetError(f"{func} 需要 order_by（前后行依赖确定行序）")
+                if offset is None:
+                    offset = 1
+                if isinstance(offset, bool) or not isinstance(offset, int):
+                    raise CustomerDatasetError(f"{func} 的 offset 必须为整数: {offset!r}")
+                if not 1 <= offset <= WINDOW_MAX_OFFSET:
+                    raise CustomerDatasetError(
+                        f"{func} 的 offset 必须在 1..{WINDOW_MAX_OFFSET} 之间（当前 {offset}）"
+                    )
+                expr, out_type = f"{func.upper()}({_quote(col)}, {offset})", col_types[col]
+                over_parts = [partition_sql, "ORDER BY " + tiebreak_order_sql]
+                normalized[-1]["offset"] = offset
+            else:
+                # 聚合类（sum/avg/min/max/count）
+                if offset is not None:
+                    raise CustomerDatasetError(f"{func} 不接受 offset（只有 lag/lead 接受）")
+                if func == "count" and col is None:
+                    expr = "COUNT(*)"
+                else:
+                    if col not in col_types:
+                        raise CustomerDatasetError(f"{func} 的 column 不存在: {col!r}")
+                    # 与 aggregate_derive 同一套类型守卫：TEXT 求和/求均值会
+                    # 被 sqlite 静默当 0 处理（脏数据制造机），如实拒绝。
+                    if func in ("sum", "avg") and col_types.get(col) == "TEXT":
+                        raise CustomerDatasetError(f"{func} 不支持 TEXT 列: {col!r}")
+                    expr = f"{func.upper()}({_quote(col)})"
+                # 类型纪律（design D4）：count 恒 INTEGER、avg 恒 REAL、
+                # sum/min/max 沿源列类型。
+                out_type = (
+                    "INTEGER"
+                    if func == "count"
+                    else "REAL"
+                    if func == "avg"
+                    else col_types[col]
+                )
+                if frame == "running":
+                    over_parts = [
+                        partition_sql,
+                        "ORDER BY " + tiebreak_order_sql,
+                        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                    ]
+                else:
+                    # whole_partition：整分区聚合（无 ORDER BY = 无累积语义）
+                    over_parts = [partition_sql]
+            over = " ".join(p for p in over_parts if p)
+            exprs.append(f"{expr} OVER ({over}) AS {_quote(alias)}")
+            out_columns.append({"name": alias, "type": out_type})
+        return exprs, out_columns, normalized
+
+    def window_rows(
+        self,
+        child_key: str,
+        parent_key: str,
+        partition_by: Optional[list] = None,
+        order_by: Optional[list] = None,
+        window: Optional[list] = None,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """窗口算子：单数据集分区/排序窗口计算 → NEW 派生数据集。
+
+        语义（design D1–D3）：输出=源列原样 + 每个 window 行一列（按 ``as``），
+        行数与源一致（窗口不改行集，行数闸=单数据集上限，超限整批拒绝）；
+        血缘 kind=``window``，spec 存完整参数（含 frame 与 tie-break 说明），
+        ``derive_refresh`` 按 spec 重放。并列排序以内部稳定行键
+        ``__row_hash`` 作最终 tie-break，重派生逐行一致；``__row_hash`` 与
+        保留前缀列绝不进输出列（复用 SQL 步骤的 ``_strip_reserved`` 纪律，
+        不新造第二套剔除逻辑）。
+        """
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        self._guard_child_key(child_key, parent_key, refresh=_refresh)
+        partition_by = [] if partition_by is None else partition_by
+        order_by = [] if order_by is None else order_by
+        with _tx() as cur:
+            meta = cur.execute(
+                "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+                (parent_key,),
+            ).fetchone()
+            if meta is None:
+                raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
+            parent_columns = json.loads(meta[0]) if meta[0] else []
+            pk_columns = list(json.loads(meta[1])) if meta[1] else []
+            col_types = {
+                c["name"]: str(c.get("type", "TEXT")).upper() for c in parent_columns
+            }
+            exprs, out_columns, normalized = self._window_plan(
+                col_types, partition_by, order_by, window
+            )
+            spec = {
+                "partition_by": list(partition_by),
+                "order_by": list(order_by),
+                "window": normalized,
+                "tiebreak": WINDOW_TIEBREAK_COL,
+            }
+            src_names = [c["name"] for c in parent_columns]
+            aliases = [w["as"] for w in normalized]
+            # 输出=源列+各窗口列；内部行键一并取出后由 _strip_reserved 剔除
+            # （它既不进输出列，也不会与物化层补写的 __row_hash 撞名）。
+            select_sql = ", ".join(
+                [_quote(n) for n in src_names]
+                + exprs
+                + [_quote(WINDOW_TIEBREAK_COL)]
+            )
+            order_sql = ""
+            if order_by:
+                # 输出行序与窗口行序同源（含 tie-break），重派生逐行一致。
+                order_sql = " ORDER BY " + ", ".join(
+                    f"{_quote(str(o['column']))} {str(o.get('dir', 'asc')).upper()}"
+                    for o in order_by
+                ) + f", {_quote(WINDOW_TIEBREAK_COL)} ASC"
+            else:
+                # 无排序列（如整分区聚合）：仍按稳定行键输出，重派生行序一致。
+                order_sql = f" ORDER BY {_quote(WINDOW_TIEBREAK_COL)} ASC"
+            raw = cur.execute(
+                f"SELECT {select_sql} FROM {_quote(_table_name(parent_key))}{order_sql}"
+            ).fetchall()
+            names = src_names + aliases + [WINDOW_TIEBREAK_COL]
+            names, raw = _strip_reserved(names, raw)
+            rows = [{n: r[i] for i, n in enumerate(names)} for r in raw]
+            # 主键原样随源列通过（窗口不重命名、不丢键）；无源主键则无子集主键
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, pk_columns, rows, parent_key, "window", spec, actor
+            )
+        self._session.expire_all()
+        return {
+            "dataset_key": child_key,
+            "rows": total,
+            "kind": "window",
+            "columns": [c["name"] for c in out_columns],
+        }
+
     def sql_query(
         self,
         sql_text: str,
@@ -3233,6 +3521,18 @@ class CustomerDatasetService:
                 parent_key,
                 spec.get("right_key", ""),
                 on=spec.get("on", "by_name"),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "window":
+            result = self.window_rows(
+                child_key,
+                parent_key,
+                partition_by=spec.get("partition_by", []),
+                order_by=spec.get("order_by", []),
+                window=spec.get("window", []),
                 actor=actor,
                 _refresh=True,
             )
@@ -3773,9 +4073,9 @@ def derive_refresh(child_key: str, actor: str = "") -> dict:
 # ── deterministic operators + SQL step (wire-transform-operators) ─────
 #
 # 工具名即 spec 冻结的契约（customer_dataset_filter / _project /
-# _aggregate_derive / _union / _sql / _sql_preview），因此模块级函数名必须与
-# 之逐字一致。`filter` 由此遮蔽内建 filter()——本模块不依赖内建 filter
-# （无一处裸调用，已核），这层遮蔽是工具名契约的代价，勿"顺手改名"。
+# _aggregate_derive / _union / _sql / _sql_preview / _window），因此模块级
+# 函数名必须与之逐字一致。`filter` 由此遮蔽内建 filter()——本模块不依赖内建
+# filter（无一处裸调用，已核），这层遮蔽是工具名契约的代价，勿"顺手改名"。
 
 
 def filter(
@@ -3922,6 +4222,61 @@ def union(
                 left_key,
                 right_key,
                 on=on,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def window(
+    child_key: str,
+    parent_key: str,
+    partition_by: Optional[list] = None,
+    order_by: Optional[list] = None,
+    window: Optional[list] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a partitioned/ordered window computation over `parent_key`
+    into a NEW child dataset: source columns passed through unchanged plus one
+    column per `window` row (named by `as`). The row set is unchanged (windows
+    never add or drop rows); lineage kind `window` records the full spec so
+    `derive_refresh` replays it.
+
+    函数闭集（design D1）：row_number/rank/dense_rank 与 lag/lead 必须有
+    `order_by`（否则 422 指名函数）；lag/lead 的 `offset` 缺省 1、必须
+    1..10000；sum/avg/min/max 的 `column` 必填且 ⊆ 列快照，count 允许无
+    column（全行计数）。`as` 必须给出、唯一、且不与源列名冲突（422 指名，
+    不静默改名）。`frame ∈ whole_partition|running`（running 必须有
+    order_by；闭集，不开放任意边界语法）；frame 只对聚合类生效——行级函数
+    （row_number/rank/dense_rank/lag/lead）的取值与帧无关。
+
+    确定性（design D2）：内部 ORDER BY 末尾追加稳定行键 `__row_hash` 作
+    最终 tie-break，并列数据重派生逐行一致；`__row_hash` 与一切保留前缀列
+    绝不进输出列。
+
+    Args:
+        child_key: Slug `^[a-z][a-z0-9_]{0,39}$` for the new child dataset.
+        parent_key: Source dataset key.
+        partition_by: 0..10 column names (⊆ column snapshot); empty = one
+            global partition.
+        order_by: 0..10 `{column, dir: asc|desc}` — required by ranking funcs
+            and lag/lead, and by `frame=running`.
+        window: 1..20 `[{func, column?, offset?, as, frame?}]`.
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label (console / data-key / agent).
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.window_rows(
+                child_key,
+                parent_key,
+                partition_by=partition_by,
+                order_by=order_by,
+                window=window,
                 actor=actor,
                 channel=channel,
             )

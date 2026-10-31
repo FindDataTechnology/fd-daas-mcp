@@ -89,11 +89,11 @@ def test_selfcheck_per_profile():
     # 11 business tools + provenance_wal_pending/ack (wire-provenance-ledger)
     # + wire-customer-data-engine §1–§4: query/aggregate/write_batch/
     # create_declared/add_column/derive/join_indicators/derive_refresh/lineage
-    # + link (wire-entity-link §1)
-    # + check/quality (wire-quality-rules-v2)
-    # + 确定性算子 filter/project/aggregate_derive/union + sql/sql_preview
-    #   (wire-transform-operators)
-    # 注：此前写死的 23 已随工具面扩张静默腐烂（实际 25→31）——本次一并对齐。
+    # + quality (wire-asset-catalog §3: read-only quality snapshot)
+    # + link (wire-transform-pipelines §1 / wire-entity-link: LEFT-JOIN
+    #   materializer, replayed through derive_refresh)
+    # + filter/project/aggregate_derive/union/sql/sql_preview
+    #   (wire-transform-operators) + window (wire-window-operator) = 31.
     assert cell_result["group_counts"].get("customer_dataset", 0) == 31
     default_result = selfcheck.run_invariants()
     assert "customer_dataset" not in default_result["group_counts"]

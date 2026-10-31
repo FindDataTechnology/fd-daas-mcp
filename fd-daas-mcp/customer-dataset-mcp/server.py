@@ -42,6 +42,8 @@ from customer_dataset_tools import (
     project,
     aggregate_derive,
     union,
+    # 窗口算子（wire-window-operator）：物化型，血缘 kind=window。
+    window,
     sql,
     sql_preview,
     provenance_wal_pending,
@@ -73,6 +75,7 @@ app.tool(filter)
 app.tool(project)
 app.tool(aggregate_derive)
 app.tool(union)
+app.tool(window)
 app.tool(sql)
 app.tool(sql_preview)
 app.tool(provenance_wal_pending)
