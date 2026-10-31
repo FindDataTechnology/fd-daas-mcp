@@ -93,8 +93,9 @@ def test_selfcheck_per_profile():
     # + link (wire-transform-pipelines §1 / wire-entity-link: LEFT-JOIN
     #   materializer, replayed through derive_refresh)
     # + filter/project/aggregate_derive/union/sql/sql_preview
-    #   (wire-transform-operators) + window (wire-window-operator) = 31.
-    assert cell_result["group_counts"].get("customer_dataset", 0) == 31
+    #   (wire-transform-operators) + window (wire-window-operator);
+    # internal-main additionally registers `check` = 32.
+    assert cell_result["group_counts"].get("customer_dataset", 0) == 32
     default_result = selfcheck.run_invariants()
     assert "customer_dataset" not in default_result["group_counts"]
 

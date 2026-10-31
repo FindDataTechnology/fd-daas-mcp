@@ -565,7 +565,7 @@ class TestDerive:
         # + link (wire-transform-pipelines §1: LEFT-JOIN materializer)
         # + filter/project/aggregate_derive/union/sql/sql_preview
         # (wire-transform-operators) + window (wire-window-operator) = 31.
-        assert result["group_counts"]["customer_dataset"] == 31
+        assert result["group_counts"]["customer_dataset"] == 32
 
 
 # ── section 4: join_indicators ───────────────────────────────────────
