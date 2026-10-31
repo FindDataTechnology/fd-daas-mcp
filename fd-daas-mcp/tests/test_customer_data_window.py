@@ -34,6 +34,7 @@ database (same pattern as test_customer_data_link.py).
 from __future__ import annotations
 
 import os
+import pathlib
 
 import pytest
 
@@ -41,8 +42,13 @@ from daas.fd_daas_mcp import registry
 
 # ── dual-backend gate (wire-window-operator 1.4) ─────────────────────
 TEST_BACKEND = os.environ.get("FD_ENGINE_TEST_BACKEND", "sqlite").strip().lower()
+#: PG 腿需要 backend adapter（wire-cell-postgres-storage）。internal-main 有
+#: `customer-dataset-mcp/db_dialect.py`；开源 main 线无 → 该 checkout 才跳过。
+_HAS_DIALECT = (
+    pathlib.Path(__file__).resolve().parents[1] / "customer-dataset-mcp" / "db_dialect.py"
+).exists()
 requires_sqlite = pytest.mark.skipif(
-    TEST_BACKEND == "postgres",
+    TEST_BACKEND == "postgres" and not _HAS_DIALECT,
     reason=(
         "window execution suite needs the sqlite write path; the PG leg "
         "requires customer-dataset-mcp/db_dialect.py "
