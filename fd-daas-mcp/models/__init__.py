@@ -21,6 +21,13 @@ from models.models import (  # noqa: F401
     DatasourceSection,
     DatasourceCollection,
     DatasourceCollectionItem,
+    # customer-dataset-mcp (wire 客户数据引擎：登记/修正/摄取/血缘)
+    # 508fa75 ponytail 清理时误删本组导出 → cell 镜像 customer_dataset 源
+    # 整体加载失败（2026-10-31 真机实证 failed=1、0 工具）；本组必须导出。
+    CustomerDataset,
+    CustomerDatasetCorrection,
+    CustomerDatasetIngest,
+    CustomerDatasetLineage,
     # daas-mcp pipeline collections (managed fetch+cron collections)
     PipelineCollection,
     PipelineCollectionItem,
