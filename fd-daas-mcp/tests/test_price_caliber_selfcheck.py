@@ -136,18 +136,34 @@ def test_read_facts_maps_config_by_astock_code_key():
     os.close(fd)
     try:
         con = sqlite3.connect(path)
-        con.execute("create table scraw_configs (name text, columns_json text)")
+        con.execute("create table scraw_configs (name text, columns_json text, created_at text)")
         con.execute("create table scraw_600519_daily (date text, close real)")
         con.executemany("insert into scraw_600519_daily values (?,?)",
                         [("2026-11-05", 1.0), ("2026-11-06", 2.0)])
-        con.execute("insert into scraw_configs values (?,?)",
-                    ("astock_600519", json.dumps(STOCK)))
+        con.execute("insert into scraw_configs values (?,?,?)",
+                    ("astock_600519", json.dumps(STOCK), "2026-10-17 15:57:59"))
         con.commit()
         con.close()
         facts = gate._read_facts(path)
         assert facts == [{"table": "scraw_600519_daily", "actual": 2,
                           "max_date": "2026-11-06",
+                          "anchor": "2026-10-17 15:57:59",
                           "config": {"source": "stock_zh_a_hist", "adjust": "qfq",
                                      "rows": 10}}]
+    finally:
+        os.unlink(path)
+
+
+def test_other_daily_tables_are_counted_not_silently_dropped():
+    """美股/宏观表不归本闸管，但要数出来——「排除项看不见」最坑人。"""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        con = sqlite3.connect(path)
+        con.execute("create table scraw_aapl_daily (date text, close real)")
+        con.execute("create table scraw_600519_daily (date text, close real)")
+        con.commit()
+        con.close()
+        assert gate._count_other_daily(path) == 1
     finally:
         os.unlink(path)

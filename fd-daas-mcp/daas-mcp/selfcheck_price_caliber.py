@@ -29,8 +29,18 @@
   **不看代码前缀判类别**——`000001` 既是上证综指也是平安银行（见
   `bare-code-collides-across-markets`），按前缀推断会把个股当指数。
 * **R3** 记录里的 `rows` ≤ 实际行数。实际更少 ⇒ 历史被重写/删除 ⇒ 命中。
+  **R3 的边界（别把它读大了）**：它抓的是"绕过 seed 的删除/重写"。用
+  `seed_astock_price.py --replace` 重播时，记录会被**一起重写**（`rows` 跟着变），
+  R3 不会响——而 `--replace` 恰恰是脚本头注指定的"分红后处置方式"，也就是**锚点
+  合法移动**的那种形态。那种形态只能靠 ref 里的 `adjustment_anchor` 变化暴露，
+  所以挂 ref 时锚点必须取自 `scraw_configs.created_at`，不能写成常量。
 * **事实档**（不计命中）：水位 `max(date)` 各表不统一时逐表打印；`rows` 与实际
-  的差额也打印（追加式刷新的常态，今天 `600519` 记 6022、实际 6037）。
+  的差额也打印（追加式刷新的常态，今天 `600519` 记 6022、实际 6037）；锚点
+  （`created_at`）随行打印，便于人工确认它有没有变。
+
+**排除项也要可见**：本闸只管 6 位代码表；`scraw_*_daily` 里其余形态（美股/宏观）
+逐个数出来打一行。今天生产是 0 张，但"排除项看不见"正是
+「放行清单为空＝看起来干净跑完」那一族。
 
 **扫到 0 张价格表 ⇒ 判不出（退 2）**：本地开发库就是这样（只有美股/宏观表）。
 "什么都没扫"不许读成"一个缺口都没有"。
@@ -39,7 +49,7 @@
 
     python selfcheck_price_caliber.py                    # 缺省读仓根 daas.db（只读）
     python selfcheck_price_caliber.py --db /app/fd-daas-mcp/data/daas.db
-    python selfcheck_price_caliber.py --self-test        # 不碰磁盘，9 条夹具
+    python selfcheck_price_caliber.py --self-test        # 不碰磁盘，11 条夹具
 
 只读：`sqlite3` 以 `mode=ro` + `PRAGMA query_only=ON` 打开，不写盘、不改库。
 
@@ -148,10 +158,11 @@ def _read_facts(db: str) -> list[dict]:
         con.execute("PRAGMA query_only=ON")
         tables = [r[0] for r in con.execute(
             "select name from sqlite_master where type='table'")]
-        cfgs = {}
+        cfgs: dict[str, tuple] = {}
         try:
-            for name, cols in con.execute("select name, columns_json from scraw_configs"):
-                cfgs[name] = cols
+            for name, cols, created in con.execute(
+                    "select name, columns_json, created_at from scraw_configs"):
+                cfgs[name] = (cols, created)
         except sqlite3.Error:
             cfgs = {}
         facts = []
@@ -164,22 +175,38 @@ def _read_facts(db: str) -> list[dict]:
             cols = [r[1] for r in con.execute(f'PRAGMA table_info("{t}")')]
             mx = (con.execute(f'select max(date) from "{t}"').fetchone()[0]
                   if "date" in cols else None)
-            raw = cfgs.get(f"astock_{code}")
+            raw, anchor = cfgs.get(f"astock_{code}", (None, None))
             cfg = None
             if raw is not None:
                 try:
                     cfg = json.loads(raw)
                 except Exception as exc:  # noqa: BLE001
                     cfg = f"{type(exc).__name__}: {exc}"
-            facts.append({"table": t, "actual": n, "max_date": mx, "config": cfg})
+            facts.append({"table": t, "actual": n, "max_date": mx,
+                          "config": cfg, "anchor": anchor})
         return facts
     finally:
         con.close()
 
 
+def _count_other_daily(db: str) -> int:
+    """`scraw_*_daily` 里**不归本闸管**的张数（美股/宏观等非 6 位代码表）。
+
+    刻意排除，但**不许静默**：排除项看不见，正是「放行清单为空＝看起来干净跑完」
+    那一族。今天生产是 0 张，将来出现一张就该在这一行里露出来。
+    """
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return sum(1 for (t,) in con.execute(
+            "select name from sqlite_master where type='table' "
+            "and name like 'scraw_%_daily'") if not PRICE_TABLE.match(t))
+    finally:
+        con.close()
+
+
 def _self_test() -> int:
-    """9 条：绿（含追加）/无记录/记录坏/source 未知/口径不符/行数缩水/水位不统一/
-    空库判不出/前缀不推断类别。"""
+    """11 条：绿（含追加）/无记录/记录坏/source 未知/口径不符/行数缩水/水位不统一/
+    000001 不按前缀猜/空库判不出/排除项可数。"""
     ok = True
 
     def check(label, cond, extra=""):
@@ -240,6 +267,12 @@ def _self_test() -> int:
         con.close()
         empty = _read_facts(path)
         check("扫到 0 张价格表 ⇒ 判不出", empty == [], empty)
+        con = sqlite3.connect(path)
+        con.execute("create table scraw_aapl_daily (date text, close real)")
+        con.commit()
+        con.close()
+        check("排除项可数（美股表 1 张）", _count_other_daily(path) == 1,
+              _count_other_daily(path))
     finally:
         os.unlink(path)
     return 0 if ok else 1
@@ -280,6 +313,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{mark[r['verdict']]} {r['table']} [{r['verdict']}]: {r['detail']}")
     for n in notes:
         print(n)
+    # 锚点单独一行：它是 ref 里最容易写成常量的那个字段，必须看得见它有没有变。
+    by_day: dict[str, list[str]] = {}
+    for f in facts:
+        a = f.get("anchor")
+        if a:
+            by_day.setdefault(str(a)[:10], []).append(f["table"])
+    if by_day:
+        parts = [f"{d}（{len(ts)} 张）" for d, ts in sorted(by_day.items())]
+        print(f"~ 锚点（scraw_configs.created_at）：{' / '.join(parts)}"
+              f" —— 挂 ref 时 adjustment_anchor 取这里，不要写成常量"
+              f"（--replace 重播会连它一起变，而 R3 抓不到那一路）")
+    other = _count_other_daily(db)
+    if other:
+        print(f"~ 另有 {other} 张非 6 位代码的 scraw_*_daily 未纳入本闸"
+              f"（美股/宏观，不在本闸口径内）—— 列出来是因为「排除项看不见」最坑人")
     if hits:
         print("\n改法：① 缺记录 ⇒ 用 seed_astock_price.py 重播该表（会写 scraw_configs）；"
               "② 记录与数据不符 ⇒ 先查是哪边错，别只改 json（改记录比改数据便宜，"
