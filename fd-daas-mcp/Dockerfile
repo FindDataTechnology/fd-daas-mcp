@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir --prefer-binary --prefix=/install \
     "uvicorn" \
     "starlette" \
     "httpx" \
-    "akshare>=1.18"
+    "akshare==1.19.1"
 # ↑ akshare 只服务**刷新作业**（`daas-mcp/refresh_astock_to_today.py` /
 #   `seed_astock_*.py`），服务进程本身不 import 它。2026-11-15 之前它只作为
 #   pyproject 的可选 extra 存在，于是集群里**没有任何镜像能跑刷新**——通道 B 的
@@ -38,6 +38,17 @@ RUN pip install --no-cache-dir --prefer-binary --prefix=/install \
 #   一个，是因为 daas.db 在 node-bound 的 local-path PVC 上、且 cheap 集群禁放
 #   scraw 镜像 ⇒ 刷新作业必须落在这台机、并复用这个已带 sqlalchemy 与 models 的
 #   环境。代价是镜像增大（akshare 及其依赖）；没有它，"刷新"这条路根本不存在。
+#
+#   **为什么钉死 1.19.1 而不是 >=1.18**：2026-11-15 在镜像内实测装到的是
+#   1.20.63，而 1.20.46 把 `stock_zh_a_daily` → `stock_zh_a_daily_sina`、
+#   `stock_zh_a_hist` → `stock_zh_a_hist_em` 全改了名 ⇒ `seed_astock_price`
+#   的 sina 与 eastmoney 两条适配器直接 AttributeError，`fetch_bars` 只剩
+#   tencent 能赢（实测日志 `route=tencent`）。而 tencent 的 qfq 是**加法式**、
+#   volume 量纲是**手**（sina 是股，差 100 倍）⇒ 新行会以另一种口径与量纲
+#   接在 sina 历史上，**价格与成交量列都静默错**。
+#   1.19.1 是本机（`fd-paper-trading/.venv`）产出并校验过现有数据的那一版。
+#   升级适配器是一个独立变更：要同时改 `seed_astock_price` 的三个 `_fetch_via_*`
+#   并重跑质量门，不能在"补个依赖"里顺手做。
 
 # Runtime stage
 FROM python:3.12-slim
