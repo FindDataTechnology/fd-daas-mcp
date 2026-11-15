@@ -221,6 +221,54 @@ class AlertDatabase:
             rows = conn.execute(sql, params).fetchall()
         return [{"date": str(r[0]), "value": r[1]} for r in rows]
 
+    def series_stats(self, source_table: str) -> dict:
+        """价格表的出处统计：口径记录 + **整张表**的窗口与行数。
+
+        只给 `scraw_<6位>_daily` 用（调用方先用 `series_ref.is_price_table` 判形状）。
+        窗口与行数一律取表内 `min(date)`/`max(date)`/`count(*)`，不是调用方那一页——
+        `limit` 是分页参数，不是数据身份（见 `series_ref` 的模块头注）。
+
+        `config` 取 `scraw_configs` 里键 `astock_<code>` 的最新一行，并把该行自己的
+        `created_at` 并进去——前复权的**锚点**只在那一列里（刷新是追加式、不改记录，
+        所以它一直是"种下那一轮"的时刻）。
+        """
+        from series_ref import is_price_table
+
+        code = is_price_table(source_table)
+        if code is None:
+            raise AlertError(f"not a price table: {source_table}")
+        validate_identifier(source_table)
+        if not self.column_exists(source_table, "date"):
+            raise AlertError(f"price table has no date column: {source_table}")
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT columns_json, created_at FROM scraw_configs "
+                     "WHERE name = :n ORDER BY id DESC LIMIT 1"),
+                {"n": f"astock_{code}"},
+            ).fetchone()
+            n, dmin, dmax = conn.execute(
+                text(f'SELECT count(*), min("date"), max("date") FROM "{source_table}"')
+            ).fetchone()
+        config = None
+        if row is not None and row[0] is not None:
+            try:
+                config = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            except (TypeError, ValueError) as exc:
+                # 记录坏了要能说出来：调用方据此三态留痕，而不是留一个空对象。
+                config = f"{type(exc).__name__}: {exc}"
+            if isinstance(config, dict) and row[1]:
+                config = {**config, "created_at": str(row[1])}
+        return {"config": config, "min_date": dmin, "max_date": dmax,
+                "row_count": int(n)}
+
+    @property
+    def db_label(self) -> str:
+        """库的文件名，进 ref 的 `db_source`（sqlite 就是文件名）。"""
+        url = self._database_url
+        if "///" in url:
+            return Path(url.split("///", 1)[-1]).name or url
+        return url
+
     # ── AlertRule CRUD ───────────────────────────────────────────
 
     def create_rule(

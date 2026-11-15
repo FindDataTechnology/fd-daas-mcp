@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import series_ref
 from alert_database import AlertError, get_db
 from engine import run_rule as _run_rule
 from notifiers import list_channels as _list_channels
@@ -25,14 +26,41 @@ def get_series_latest(
     series_filter_json: Optional[dict] = None,
     limit: int = 10,
 ) -> dict:
-    """Latest N rows of a series ordered by date_column desc (alert-scoped inspection)."""
+    """Latest N rows of a series ordered by date_column desc (alert-scoped inspection).
+
+    **价格表额外附带出处。** 对 `scraw_<6位>_daily`，返回体加一个 `series_ref`
+    （`source_id`/`symbol`/`adjustment`/`as_of_max`/`fingerprint` 等），出处取自
+    `scraw_configs` + 表自己的窗口/行数；**出不来时给 `series_ref_withheld` 原因码**
+    （`no_config`/`bad_config`/`unknown_source`/`caliber_unknown`/`no_as_of_max`/
+    `no_adjustment_anchor`）——三态留痕，不留空对象、也不假装口径已知。
+
+    非价格表（`observations` 等）返回体形状不变：不替没有口径声明的东西背书。
+    """
+    db = get_db()
     try:
-        rows = get_db().get_series_latest(
+        rows = db.get_series_latest(
             source_table, series_filter_json, date_column, value_column, limit
         )
     except AlertError as e:
         return {"error": str(e)}
-    return {"rows": rows}
+    out: dict = {"rows": rows}
+    code = series_ref.is_price_table(source_table)
+    if code is not None:
+        try:
+            stats = db.series_stats(source_table)
+        except AlertError as e:
+            out["series_ref_withheld"] = f"stats_unavailable: {e}"
+            return out
+        ref, why = series_ref.build_ref(
+            table=source_table, code=code, config=stats["config"],
+            max_date=stats["max_date"], min_date=stats["min_date"],
+            row_count=stats["row_count"], db_source=db.db_label,
+        )
+        if ref is None:
+            out["series_ref_withheld"] = why
+        else:
+            out["series_ref"] = ref
+    return out
 
 
 def create_alert_rule(
