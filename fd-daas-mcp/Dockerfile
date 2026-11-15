@@ -28,7 +28,16 @@ RUN pip install --no-cache-dir --prefer-binary --prefix=/install \
     "fd-open-data-mcp" \
     "uvicorn" \
     "starlette" \
-    "httpx"
+    "httpx" \
+    "akshare>=1.18"
+# ↑ akshare 只服务**刷新作业**（`daas-mcp/refresh_astock_to_today.py` /
+#   `seed_astock_*.py`），服务进程本身不 import 它。2026-11-15 之前它只作为
+#   pyproject 的可选 extra 存在，于是集群里**没有任何镜像能跑刷新**——通道 B 的
+#   价格表因此从 11-06 冻到 11-15（详见 change1 4.4 注记与
+#   reports/channel-b-caliber-measured.md 第七节）。装进同一个镜像而不是另建
+#   一个，是因为 daas.db 在 node-bound 的 local-path PVC 上、且 cheap 集群禁放
+#   scraw 镜像 ⇒ 刷新作业必须落在这台机、并复用这个已带 sqlalchemy 与 models 的
+#   环境。代价是镜像增大（akshare 及其依赖）；没有它，"刷新"这条路根本不存在。
 
 # Runtime stage
 FROM python:3.12-slim
