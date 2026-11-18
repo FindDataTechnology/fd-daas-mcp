@@ -332,6 +332,13 @@ class ProcessDatabase:
             IT.validate_op(op, params)
         except IT.IndicatorError as e:
             raise ProcessError(str(e))
+        # Ops taking a second column (ratio/multiply) must have it validated too —
+        # it is interpolated into the same source query as value_column.
+        other = (params or {}).get("other_column")
+        if other is not None:
+            validate_identifier(other)
+            if not self.column_exists(source_table, other):
+                raise ProcessError(f"other_column not found in source table: {other}")
 
         session = self.get_session()
         try:
@@ -458,6 +465,13 @@ class ProcessDatabase:
                     IT.validate_op(new_op, new_params)
                 except IT.IndicatorError as e:
                     raise ProcessError(str(e))
+                other = (new_params or {}).get("other_column")
+                if other is not None:
+                    validate_identifier(other)
+                    if not self.column_exists(tbl, other):
+                        raise ProcessError(
+                            f"other_column not found in source table: {other}"
+                        )
             # `score` is handled explicitly so None clears it (the generic loop
             # below skips None). `score` may be None (clear) or a float.
             if "score" in fields:
@@ -491,10 +505,56 @@ class ProcessDatabase:
         finally:
             session.close()
 
+    def audit_dangling_indicators(self, disable: bool = False) -> dict:
+        """Find indicator rules whose `source_table` no longer exists.
+
+        A rule pointing at a dropped source table can only fail at run time;
+        they accumulate silently when a source MCP is retired (the 3 wbdata
+        rules are the known case). Returns each dangling rule with its name,
+        datasource and the missing table; with `disable=True` also flips
+        `enabled` to False on them (rows are kept — no delete, so the audit
+        trail survives).
+        """
+        session = self.get_session()
+        try:
+            rules = session.query(IndicatorRule).all()
+            dangling: list[dict] = []
+            for r in rules:
+                if r.source_table and not self.table_exists(r.source_table):
+                    dangling.append({
+                        "name": r.name,
+                        "datasource": r.datasource,
+                        "missing_table": r.source_table,
+                        "enabled": bool(r.enabled),
+                    })
+            disabled: list[str] = []
+            if disable:
+                for d in dangling:
+                    if d["enabled"]:
+                        row = (
+                            session.query(IndicatorRule)
+                            .filter(IndicatorRule.name == d["name"])
+                            .first()
+                        )
+                        if row is not None:
+                            row.enabled = False
+                            disabled.append(row.name)
+                session.commit()
+            return {
+                "dangling": dangling,
+                "count": len(dangling),
+                "disabled": disabled,
+            }
+        finally:
+            session.close()
+
     def fetch_indicator_series(
-        self, source_table: str, date_column: str, value_column: str
+        self, source_table: str, date_column: str, value_column: str,
+        other_column: Optional[str] = None,
     ) -> list[tuple]:
-        """Return [(date, value)] for the full source table, ordered by date_column.
+        """Return [(date, value)] — or [(date, value, other)] when a second
+        column is requested (op `ratio`/`multiply` need it) — for the full
+        source table, ordered by date_column.
 
         Identifiers are guarded + existence-checked before interpolation
         (they cannot be bind parameters).
@@ -502,19 +562,26 @@ class ProcessDatabase:
         validate_identifier(source_table)
         validate_identifier(date_column)
         validate_identifier(value_column)
+        if other_column is not None:
+            validate_identifier(other_column)
         if not self.table_exists(source_table):
             raise ProcessError(f"source table not found: {source_table}")
         if not self.column_exists(source_table, date_column):
             raise ProcessError(f"date_column not found in source table: {date_column}")
         if not self.column_exists(source_table, value_column):
             raise ProcessError(f"value_column not found in source table: {value_column}")
+        if other_column is not None and not self.column_exists(source_table, other_column):
+            raise ProcessError(f"other_column not found in source table: {other_column}")
+        cols = f'"{date_column}", "{value_column}"'
+        if other_column is not None:
+            cols += f', "{other_column}"'
         sql = text(
-            f'SELECT "{date_column}", "{value_column}" FROM "{source_table}" '
+            f"SELECT {cols} FROM \"{source_table}\" "
             f'ORDER BY "{date_column}"'
         )
         with self.engine.connect() as conn:
             rows = conn.execute(sql).fetchall()
-        return [(r[0], r[1]) for r in rows]
+        return [tuple(r) for r in rows]
 
     def upsert_observations(
         self,
@@ -572,19 +639,32 @@ class ProcessDatabase:
         row = self.get_indicator_row(name)
         if row is None:
             return {"error": f"indicator not found: {name}"}
+        # Check the source table before the enabled flag: a dangling rule must
+        # fail by naming its missing table (that is the actionable fact), not
+        # by a generic "disabled" — the audit uses the same predicate.
+        if row.source_table and not self.table_exists(row.source_table):
+            return {
+                "error": f"source table not found: {row.source_table} "
+                         f"(indicator '{name}' is dangling)"
+            }
         if not row.enabled:
             return {"error": f"indicator disabled: {name}"}
 
         try:
+            other = (row.params_json or {}).get("other_column")
             rows = self.fetch_indicator_series(
-                row.source_table, row.date_column, row.value_column
+                row.source_table, row.date_column, row.value_column,
+                other_column=other,
             )
         except ProcessError as e:
             return {"error": str(e)}
         if not rows:
             return {"rule": name, "rows_written": 0, "up_to_date": True}
 
-        df = pd.DataFrame(rows, columns=[row.date_column, row.value_column])
+        if other is not None:
+            df = pd.DataFrame(rows, columns=[row.date_column, row.value_column, other])
+        else:
+            df = pd.DataFrame(rows, columns=[row.date_column, row.value_column])
         try:
             computed = IT.compute_series(
                 df, row.value_column, row.op, row.params_json

@@ -105,6 +105,9 @@ groups:
       extract_file: internal
       run_indicator: internal
       calculate_indicator: internal
+      # 悬空 source_table 审计：只读报告 + 可选的 enabled=0 翻转（永不删除规则）。
+      # internal 而非 commercial——它暴露的是运维面的口径健康，不是供给能力。
+      audit_indicators: internal
       # --- datasource / category / form mutation ---
       create_datasource: internal
       update_datasource: internal
