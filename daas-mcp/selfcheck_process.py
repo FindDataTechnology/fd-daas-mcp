@@ -73,86 +73,45 @@ tables = db.list_source_tables()
 check("list_source_tables finds scraw_selfcheck", any(t["name"] == "scraw_selfcheck" for t in tables))
 check("list_source_tables excludes scraw_configs", not any(t["name"] == "scraw_configs" for t in tables))
 
-# ── 3. rule CRUD ────────────────────────────────────────────────
-schema = {"type": "object", "properties": {"sentiment": {"type": "string"}}}
-r = db.create_rule(name="sc", source_table="scraw_selfcheck", text_column="body", schema_json=schema)
-check("create_rule ok", r["name"] == "sc" and r["source_table"] == "scraw_selfcheck")
-check("list_rules includes sc", any(x["name"] == "sc" for x in db.list_rules()))
-check("get_rule ok", db.get_rule("sc")["text_column"] == "body")
-check("update_rule max_chars", db.update_rule("sc", max_chars=8000)["max_chars"] == 8000)
+# ── 3. rule store smoke (the unified rule_tools system) ─────────
+# The legacy process_database rule CRUD was subsumed by `rules` + rule_tools
+# (json/script/position/llm); its full coverage lives in tests/test_rule_tools.py.
+# Here we only assert the store is wired into this DB and rejects bad input.
+import rule_tools as RT  # noqa: E402
 
-# create_rule rejects bad table / column
+_rt = RT.create_rule(name="sc", rule_type="json", config_json={"match": {"eq": 1}})
+check("rule_tools.create_rule ok", "error" not in _rt and _rt.get("name") == "sc", str(_rt)[:160])
+check("rule_tools.list_rules includes sc", any(x["name"] == "sc" for x in RT.list_rules().get("rules", [])))
+check("rule_tools.get_rule ok", RT.get_rule("sc").get("name") == "sc")
+check("rule_tools.update_rule description", RT.update_rule("sc", description="d")["description"] == "d")
+
+_bad = RT.create_rule(name="bad", rule_type="nope", config_json={})
+check("create_rule rejects unknown rule_type", "error" in _bad, str(_bad)[:160])
+_dup = RT.create_rule(name="sc", rule_type="json", config_json={"match": {"eq": 1}})
+check("create_rule rejects duplicate name", "error" in _dup, str(_dup)[:160])
+
+# ── 4. injection guard on the indicator source fetch ────────────
 try:
-    db.create_rule(name="bad", source_table="scraw_nope", text_column="body", schema_json=schema)
-    check("create_rule rejects missing table", False)
+    db.fetch_indicator_series("scraw_x; DROP", "date", "close")
+    check("injection blocked in fetch_indicator_series", False)
 except pdb.ProcessError:
-    check("create_rule rejects missing table", True)
+    check("injection blocked in fetch_indicator_series", True)
 try:
-    db.create_rule(name="bad2", source_table="scraw_selfcheck", text_column="nope", schema_json=schema)
-    check("create_rule rejects missing column", False)
+    db.fetch_indicator_series("scraw_selfcheck", "date; DROP", "body")
+    check("injection blocked in date_column", False)
 except pdb.ProcessError:
-    check("create_rule rejects missing column", True)
+    check("injection blocked in date_column", True)
 
-# ── 4. injection guard ──────────────────────────────────────────
-try:
-    db.create_rule(name="inj", source_table="scraw_x; DROP TABLE sources;--", text_column="body", schema_json=schema)
-    check("injection blocked in create_rule", False)
-except pdb.ProcessError:
-    check("injection blocked in create_rule", True)
-try:
-    db.fetch_source_rows("scraw_x; DROP", "body", 0, 10)
-    check("injection blocked in fetch_source_rows", False)
-except pdb.ProcessError:
-    check("injection blocked in fetch_source_rows", True)
+# ── 5. delete_rule via rule_tools ───────────────────────────────
+_ok_del = RT.delete_rule("sc")
+check("delete_rule ok", "error" not in _ok_del, str(_ok_del)[:160])
+check("rule gone after delete", RT.get_rule("sc").get("error") is not None)
 
-# ── 5. run_rule incremental + idempotent (extract_text mocked) ──
-calls = {"n": 0}
-
-
-def _fake_extract(text, schema, prompt=None, model=None, max_chars=12000):
-    calls["n"] += 1
-    return {"records": [{"sentiment": "neutral", "src": text}], "count": 1, "chunk_count": 1}
-
-
-_orig = T.extract_text
-T.extract_text = _fake_extract
-try:
-    # server imports process_tools as T (same module object), so the monkeypatch
-    # is visible to _run_rule_impl via T.extract_text — but server captured the
-    # name at call time, so patch the module server uses:
-    import process_tools as _pt
-    _pt.extract_text = _fake_extract
-
-    out1 = server._run_rule_impl("sc", batch=500)
-    check("run_rule first: processed=3", out1.get("processed") == 3, str(out1))
-    check("run_rule first: cursor advanced", out1.get("next_rowid") == 3, str(out1))
-    n_results = db.count_results(r["id"])
-    check("process_results has 3 rows", n_results == 3, f"got {n_results}")
-
-    out2 = server._run_rule_impl("sc", batch=500)
-    check("run_rule second: processed=0", out2.get("processed") == 0, str(out2))
-    check("run_rule second: up_to_date", out2.get("up_to_date") is True, str(out2))
-    check("process_results still 3 (no dupes)", db.count_results(r["id"]) == 3)
-
-    # re-run after deleting one result row → idempotent (no dupe), cursor already maxed
-    with db.engine.begin() as conn:
-        conn.execute(pdb.text("DELETE FROM process_results WHERE rule_id=:rid AND source_rowid=1"), {"rid": r["id"]})
-    out3 = server._run_rule_impl("sc", batch=500)
-    check("run_rule re-run after delete: up_to_date (cursor already maxed)", out3.get("up_to_date") is True, str(out3))
-finally:
-    T.extract_text = _orig
-    _pt.extract_text = _orig
-
-# ── 6. delete_rule cascades ─────────────────────────────────────
-ok = db.delete_rule("sc")
-check("delete_rule ok", ok is True)
-check("process_results cascaded to 0", db.count_results(r["id"]) == 0)
-
-# ── 7. indicator rule → observations (deterministic, no LLM) ─────
-# The LLM path above (run_rule) must not have written any observations.
+# ── 6. indicator rule → observations (deterministic, no LLM) ─────
+# No LLM path runs in this file, so observations must start empty.
 with db.engine.connect() as conn:
     obs_before = conn.execute(pdb.text("SELECT count(*) FROM observations")).scalar()
-check("run_rule path wrote no observations", obs_before == 0, f"got {obs_before}")
+check("no observations before indicator run", obs_before == 0, f"got {obs_before}")
 
 # Build a numeric series table + a daas source row (soft-ref target).
 with db.engine.begin() as conn:
@@ -238,6 +197,43 @@ check("delete_indicator ok", ok is True)
 with db.engine.connect() as conn:
     n_survive = conn.execute(pdb.text("SELECT count(*) FROM observations WHERE source='selfcheck_src'")).scalar()
 check("observations survive indicator delete (soft ref)", n_survive == 4, f"got {n_survive}")
+
+# ── 7. dangling-rule governance ─────────────────────────────────
+# A rule whose source_table no longer exists (retired source MCP) must be
+# detected by the audit and fail its run by naming the missing table.
+with db.engine.begin() as conn:
+    conn.execute(pdb.text(
+        "CREATE TABLE scraw_dangling (id INTEGER PRIMARY KEY, date TEXT, close REAL)"
+    ))
+db.create_indicator(
+    name="dangling_rule", datasource="selfcheck_src", source_table="scraw_dangling",
+    date_column="date", value_column="close", op="level",
+)
+with db.engine.begin() as conn:
+    conn.execute(pdb.text("DROP TABLE scraw_dangling"))
+
+_audit = db.audit_dangling_indicators(disable=False)
+_d = [x for x in _audit["dangling"] if x["name"] == "dangling_rule"]
+check("audit finds dangling rule", len(_d) == 1, str(_audit["dangling"]))
+check("audit names the missing table", _d and _d[0]["missing_table"] == "scraw_dangling", str(_d))
+
+_run_d = db.run_indicator("dangling_rule")
+check(
+    "run on dangling rule errors naming the missing table",
+    "scraw_dangling" in str(_run_d.get("error", "")) and "dangling" in str(_run_d.get("error", "")),
+    str(_run_d),
+)
+with db.engine.connect() as conn:
+    _n_d = conn.execute(pdb.text("SELECT count(*) FROM observations WHERE indicator='dangling_rule'")).scalar()
+check("dangling run wrote no observations", _n_d == 0, f"got {_n_d}")
+
+_audit2 = db.audit_dangling_indicators(disable=True)
+check("audit --disable flips the rule", "dangling_rule" in _audit2["disabled"], str(_audit2["disabled"]))
+check(
+    "disabled dangling rule still present (kept, not deleted)",
+    db.get_indicator("dangling_rule") is not None,
+)
+db.delete_indicator("dangling_rule")
 
 # ── 8. CLI branch exits without stdio ───────────────────────────
 import subprocess

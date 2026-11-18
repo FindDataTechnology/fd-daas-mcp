@@ -1672,6 +1672,11 @@ class CustomerDatasetCorrection(Base):
     values_json = Column(JSON, nullable=True)
     old_values_json = Column(JSON, nullable=True)
     actor = Column(String(255), nullable=False, default="")
+    # channel attribution (wire-customer-data-engine §2, ADR-0006): every edit
+    # record names its write channel — console member, data-plane key or agent.
+    channel = Column(String(16), nullable=False, default="console")  # console | data-key | agent
+    actor_id = Column(String(255), nullable=True)
+    actor_label = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     reverted_at = Column(DateTime, nullable=True)
     dangling_at = Column(DateTime, nullable=True)
@@ -1687,6 +1692,9 @@ class CustomerDatasetCorrection(Base):
             "values": self.values_json,
             "old_values": self.old_values_json,
             "actor": self.actor,
+            "channel": self.channel,
+            "actor_id": self.actor_id,
+            "actor_label": self.actor_label,
             "created_at": fmt(self.created_at),
             "reverted_at": fmt(self.reverted_at),
             "dangling_at": fmt(self.dangling_at),
@@ -1720,4 +1728,37 @@ class CustomerDatasetIngest(Base):
             "started_at": fmt(self.started_at),
             "finished_at": fmt(self.finished_at),
             "error": self.error,
+        }
+
+
+class CustomerDatasetLineage(Base):
+    """One derived dataset's lineage (wire-customer-data-engine §3): the
+    parent dataset plus the derivation spec that produced the child, with the
+    latest refresh outcome. A parent with live children cannot be deleted."""
+
+    __tablename__ = "customer_dataset_lineage"
+    __table_args__ = (UniqueConstraint("dataset_key", name="uq_customer_dataset_lineage_child"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_key = Column(String(64), nullable=False, index=True)  # the child
+    parent_key = Column(String(64), nullable=False, index=True)
+    kind = Column(String(16), nullable=False, default="query")  # query | join
+    spec_json = Column(JSON, nullable=False)
+    status = Column(String(16), nullable=False, default="never")  # never | ok | failed
+    last_run_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> dict:
+        fmt = lambda v: v.isoformat() if v else None  # noqa: E731
+        return {
+            "id": self.id,
+            "dataset_key": self.dataset_key,
+            "parent_key": self.parent_key,
+            "kind": self.kind,
+            "spec": self.spec_json,
+            "status": self.status,
+            "last_run_at": fmt(self.last_run_at),
+            "last_error": self.last_error,
+            "created_at": fmt(self.created_at),
         }

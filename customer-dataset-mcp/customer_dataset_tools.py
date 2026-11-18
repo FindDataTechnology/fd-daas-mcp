@@ -13,10 +13,31 @@ canonical row JSON — computed here, uniformly for uploads and connector pushes
 ``ingest_commit`` swaps the staging table into the base atomically (single
 SQLite transaction), rebuilds the effective table and replays every active
 correction; anchors that no longer match are marked dangling (kept, never
-silently dropped). The customer source is never written to.
+silently dropped). The customer source is never written to. An optional
+``mode`` on ``ingest_begin`` selects the commit semantics: ``replace``
+(default, the atomic full-snapshot swap) or ``merge`` — an incremental
+commit that upserts the staged rows into the base by the dataset's primary
+key (connector watermark sync; rows absent from staging are kept, so
+source-side deletes never propagate).
 
 All writes go through one raw sqlite connection per call (explicit
 BEGIN IMMEDIATE … COMMIT); the ORM session is used for reads only.
+
+Provenance WAL (wire-provenance-ledger, design D3 — two-stage collection):
+every mutation that the platform provenance ledger cares about also appends
+one row to ``cell_event_wal`` INSIDE the same transaction as the change
+itself, so data and event commit or roll back together (crash ⇒ zero lost
+events, zero orphan events). Event types: ``dataset.correction.added`` /
+``dataset.correction.reverted`` / ``dataset.correction.dangling`` /
+``dataset.snapshot.refreshed`` / ``dataset.deleted``. The platform-side
+forwarder drains un-acked rows via ``provenance_wal_pending`` /
+``provenance_wal_ack``. The WAL is written UNCONDITIONALLY: the engine does
+not know platform provenance tiers — a dataset on the ``off`` tier is
+skipped by the platform-side forwarder (which simply does not forward those
+events into the ledger), never by the engine (always writing is cheap and
+safe). The WAL itself carries no tamper-proofing: immutability is enforced
+at the platform ledger; here only the ``acked`` forwarding bookkeeping bit
+is mutable by design.
 
 Frozen interface: openspec/changes/wire-customer-local-data/reports/interfaces.md §2.
 """
@@ -26,7 +47,9 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -43,6 +66,7 @@ if str(_DAAS_MCP_DIR) not in sys.path:
 
 from daas_database import get_database  # noqa: E402
 from models import CustomerDataset, CustomerDatasetCorrection, CustomerDatasetIngest  # noqa: E402
+from sqlalchemy import inspect as sa_inspect, text as sa_text  # noqa: E402
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _COL_RE = re.compile(r'^[^\x00-\x1f"]{1,64}$')
@@ -52,6 +76,131 @@ DEFAULT_MAX_ROWS = 500_000
 
 _DANGLING_NO_MATCH = "行锚在最新快照中无匹配行"
 _DANGLING_NO_COLUMN = "修正涉及的列在新快照中不存在"
+
+# ── structured query surface (wire-customer-data-engine D1) ──────────
+# Whitelisted filter operators → parameterized SQL fragments only; values are
+# never interpolated into SQL text. The row cap and the progress-handler
+# timeout are the two guards every query path goes through.
+_QUERY_OPS = frozenset(
+    {
+        "eq", "ne", "gt", "gte", "lt", "lte", "in", "notin", "like", "isnull",
+        "notnull",
+        # 确定性算子的面板查询契约（wire-transform-operators）：两个仿射操作符
+        # 接进同一个构造器——一套语义，查询面与算子面共用（值永远参数化）。
+        "contains", "startswith",
+    }
+)
+_QUERY_OPS_SQL = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+_AGG_FUNCS = frozenset({"count", "sum", "avg", "min", "max"})
+QUERY_ROW_CAP = 1000
+QUERY_TIMEOUT_S = 5.0
+
+# ── deterministic operators (wire-transform-operators D1/D2) ─────────
+#: 分组列 / 度量个数上限（spec「确定性算子工具契约」：group_by 1..10、
+#: measures 1..20）
+OPERATOR_MAX_GROUP_BY = 10
+OPERATOR_MAX_MEASURES = 20
+
+# ── window operator (wire-window-operator D1/D2) ─────────────────────
+#: 分区列 / 排序列 / 窗口行个数上限（design D1：partition_by 0..10、
+#: order_by 0..10、window 1..20）
+WINDOW_MAX_PARTITION_BY = 10
+WINDOW_MAX_ORDER_BY = 10
+WINDOW_MAX_ROWS = 20
+#: lag/lead 位移上限（防病态：10 万行偏移 = 逐行回溯的病态代价）
+WINDOW_MAX_OFFSET = 10_000
+#: 函数闭集（design D1）——排序类与 lag/lead 必须有 order_by。
+WINDOW_FUNCS = frozenset(
+    {"row_number", "rank", "dense_rank", "lag", "lead", "sum", "avg", "min", "max", "count"}
+)
+WINDOW_RANKING_FUNCS = frozenset({"row_number", "rank", "dense_rank"})
+WINDOW_OFFSET_FUNCS = frozenset({"lag", "lead"})
+WINDOW_AGG_FUNCS = frozenset({"sum", "avg", "min", "max", "count"})
+#: frame 闭集（design D2）：整分区 / 累积到当前行；不开放任意边界语法。
+WINDOW_FRAMES = frozenset({"whole_partition", "running"})
+#: 稳定行键：并列排序的最终 tie-break（design D2），绝不进输出列。
+WINDOW_TIEBREAK_COL = "__row_hash"
+
+# ── SQL step guardrails (wire-transform-operators D3) ────────────────
+#: SQL 文本长度上限（护栏之外的输入尺寸闸——超长文本本身即异常用法）
+SQL_MAX_LENGTH = 20_000
+#: 执行超时（秒，可由环境变量调）；超时如实失败，不拖死 cell 单写者
+try:
+    SQL_TIMEOUT_S = float(os.environ.get("CUSTOMER_DATASET_SQL_TIMEOUT_S", "30"))
+except ValueError:  # pragma: no cover - 环境变量非法时用缺省
+    SQL_TIMEOUT_S = 30.0
+#: 试运行强制预览行数（spec：强制 LIMIT 100，绝不落数据集）
+SQL_PREVIEW_LIMIT = 100
+#: 语句黑名单（词边界匹配）：任何 DDL/DML/事务/附加库语句一律拒。
+#:
+#: 这是**第一层**，只为给出人看得懂的错误文案；真正的结构性护栏是第二层
+#: sqlite 授权回调（非声明视图的 READ / 任何写动作一律 DENY）与第三层只读
+#: 连接（`mode=ro`）——前两层漏网也写不动任何东西。
+#:
+#: 刻意**不含** `replace` / `explain` / `analyze`：`replace()` 是合法字符串
+#: 函数、`EXPLAIN SELECT` 是只读诊断，误拒会挡住正常业务 SQL；它们的写形态
+#: （`REPLACE INTO`、`ANALYZE`）已被授权回调与只读连接挡死。
+_SQL_FORBIDDEN_WORDS = frozenset(
+    {
+        "insert", "update", "delete", "drop", "alter", "create", "truncate",
+        "pragma", "attach", "detach", "vacuum", "reindex", "grant", "revoke",
+        "begin", "commit", "rollback", "savepoint", "release",
+    }
+)
+#: 函数黑名单（授权回调按函数名 DENY）：文件读写 / 扩展加载 / 求值 / 分词器
+_SQL_FORBIDDEN_FUNCS = frozenset(
+    {
+        "load_extension", "readfile", "writefile", "edit", "fts3_tokenizer",
+        "sqlite_compileoption_get", "sqlite_source_id", "eval",
+    }
+)
+
+# ── write surface (wire-customer-data-engine §2, ADR-0006) ───────────
+#: every edit record names its write channel (console member / data-plane
+#: key / agent) — one overlay mechanism, channel-attributed semantics
+_CHANNELS = frozenset({"console", "data-key", "agent"})
+WRITE_BATCH_CAP = 1000
+
+# ── ingest modes (wire-connector-incremental-sync §1) ────────────────
+#: replace — staging atomically replaces the base (full snapshot, default);
+#: merge — staging is upserted into the base by pk_columns (incremental
+#: connector watermark sync; requires a declared primary key)
+_INGEST_MODES = frozenset({"replace", "merge"})
+
+# ── quality snapshot (wire-asset-catalog §3) ─────────────────────────
+#: null-rate sampling cap: the per-column null-rate pass fetches at most
+#: this many rows of the effective table (one sampled scan, NULLs counted
+#: in Python). Count-side metrics (row_count, pk uniqueness) stay exact
+#: over the FULL table — only the null-rate pass is sampled; when the table
+#: has more rows than the cap, sample_limit_hit=True reports the capping.
+QUALITY_SAMPLE_ROW_LIMIT = 10_000
+
+#: advertised by ``overview`` — the fd-wire data plane probes this instead of
+#: guessing which engine tools exist (design D1; task 1.3). ``quality`` is the
+#: read-only quality snapshot (wire-asset-catalog §3) — a False/absent value
+#: is exactly how the platform detects an engine too old for quality.
+ENGINE_CAPABILITIES = {
+    "query": True,
+    "aggregate": True,
+    "write_batch": True,
+    "create_declared": True,
+    "add_column": True,
+    "derive": True,
+    "derive_refresh": True,
+    "join_indicators": True,
+    "link": True,
+    "quality": True,
+    # 确定性算子 + SQL 步骤（wire-transform-operators）：旧镜像缺这些键，
+    # api 侧据 capability 探测给出「引擎暂不支持」的如实降级。
+    "filter": True,
+    "project": True,
+    "aggregate_derive": True,
+    "union": True,
+    "sql": True,
+    # 窗口算子（wire-window-operator）：旧镜像缺这个键，api 侧据 capability
+    # 探测给出「引擎暂不支持」的如实降级（design D6）。
+    "window": True,
+}
 
 
 class CustomerDatasetError(Exception):
@@ -104,6 +253,56 @@ def _row_hash(columns: list[str], row: dict) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
 
 
+# ── provenance WAL (wire-provenance-ledger D3: same-transaction collection) ──
+
+_WAL_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS cell_event_wal ("
+    " seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " event_id TEXT NOT NULL UNIQUE,"
+    " type TEXT NOT NULL,"
+    " payload TEXT NOT NULL,"
+    " created_at TEXT NOT NULL,"
+    " acked INTEGER NOT NULL DEFAULT 0)"
+)
+
+
+def _now_wal() -> str:
+    """UTC ISO-8601 with Z suffix (event timestamps are platform-facing)."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _wal_append(cur, type: str, payload: dict) -> None:
+    """Append one provenance event, ON THE CALLER'S OPEN TRANSACTION CURSOR.
+
+    Never opens its own transaction: being inside the caller's ``_tx()`` block
+    IS the point — the WAL row and the business change commit or roll back
+    together. Lazy table creation follows the group's existing pattern
+    (staging tables are CREATE TABLE'd inside ``_tx()`` too); IF NOT EXISTS
+    makes every call idempotent and old databases upgrade on first event.
+    """
+    cur.execute(_WAL_TABLE_SQL)
+    cur.execute(
+        "INSERT INTO cell_event_wal (event_id, type, payload, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (
+            "evt_" + uuid.uuid4().hex,
+            type,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+            _now_wal(),
+        ),
+    )
+
+
+def _wal_table_exists(cur) -> bool:
+    """True once the WAL table has been created (old DBs before any event)."""
+    return (
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cell_event_wal'"
+        ).fetchone()
+        is not None
+    )
+
+
 def _anchor_where(anchor: str, pk_columns: list[str]) -> tuple[str, list]:
     """anchor → (WHERE sql fragment, params). Raises on unusable anchors."""
     if not isinstance(anchor, str) or not anchor:
@@ -125,6 +324,564 @@ def _anchor_where(anchor: str, pk_columns: list[str]) -> tuple[str, list]:
         # inserted rows carry their anchor verbatim in __row_hash
         return f'{_quote("__row_hash")} = ?', [anchor]
     raise CustomerDatasetError(f"未知行锚形态: {anchor!r}（应为 pk:… / hash:… / ins:…）")
+
+
+def _build_where(filters: Optional[list], columns: list[str]) -> tuple[str, list]:
+    """filters → (WHERE sql fragment, params). AND composition only (v1);
+    every operator is whitelisted and every value parameterized."""
+    clauses: list[str] = []
+    params: list = []
+    for f in filters or []:
+        if not isinstance(f, dict):
+            raise CustomerDatasetError(f"过滤条件必须是对象: {f!r}")
+        col = f.get("column")
+        op = str(f.get("op", "")).lower()
+        if col not in columns:
+            raise CustomerDatasetError(f"过滤列不存在: {col!r}")
+        if op not in _QUERY_OPS:
+            raise CustomerDatasetError(f"非法过滤操作符: {op!r}（允许 {sorted(_QUERY_OPS)}）")
+        qcol = _quote(col)
+        if op in ("isnull", "notnull"):
+            clauses.append(f"{qcol} IS NULL" if op == "isnull" else f"{qcol} IS NOT NULL")
+        elif op in ("in", "notin"):
+            vals = f.get("values", f.get("value"))
+            if not isinstance(vals, list) or not vals:
+                raise CustomerDatasetError(f"{op} 过滤的 values 必须为非空数组")
+            ph = ", ".join("?" for _ in vals)
+            sql_op = "IN" if op == "in" else "NOT IN"
+            clauses.append(f"{qcol} {sql_op} ({ph})")
+            params.extend(_coerce(v) for v in vals)
+        elif op == "like":
+            clauses.append(f"{qcol} LIKE ?")
+            params.append(str(f.get("value")))
+        elif op in ("contains", "startswith"):
+            # 仿射匹配（面板查询契约）：值永远参数化，通配符只由算子自身
+            # 添加——客户值里的 % / _ 按字面量处理（转义后走 ESCAPE 子句），
+            # 否则 contains "50%" 会退化成任意匹配。
+            needle = str(f.get("value") if f.get("value") is not None else "")
+            escaped = (
+                needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            pattern = f"%{escaped}%" if op == "contains" else f"{escaped}%"
+            clauses.append(f"{qcol} LIKE ? ESCAPE '\\'")
+            params.append(pattern)
+        else:
+            clauses.append(f"{qcol} {_QUERY_OPS_SQL[op]} ?")
+            params.append(_coerce(f.get("value")))
+    return (" AND ".join(clauses), params) if clauses else ("", [])
+
+
+def _build_order(sort: Optional[list], columns: list[str]) -> str:
+    if not sort:
+        return ""
+    parts: list[str] = []
+    for s in sort:
+        if not isinstance(s, dict):
+            raise CustomerDatasetError(f"排序项必须是对象: {s!r}")
+        col = s.get("column")
+        direction = str(s.get("dir", "asc")).lower()
+        if col not in columns:
+            raise CustomerDatasetError(f"排序列不存在: {col!r}")
+        if direction not in ("asc", "desc"):
+            raise CustomerDatasetError(f"非法排序方向: {direction!r}（允许 asc/desc）")
+        parts.append(f"{_quote(col)} {direction.upper()}")
+    return " ORDER BY " + ", ".join(parts)
+
+
+# ── SQL step guardrails (wire-transform-operators D3) ────────────────
+
+_SQL_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_SQL_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SQL_CTE_RE = re.compile(r"(?:with|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+as\s*\(", re.IGNORECASE)
+
+
+def _sql_tokens(sql: str) -> str:
+    """切分 SQL 并丢弃注释：区分「引号内字面量」与「代码」。
+
+    取代一次性正则的原因：注释里的 `DROP TABLE` 不该误伤，字符串字面量里的
+    `{orders}` 也不该被当占位替换（两者都会把正常 SQL 判死或改坏）。
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "-" and sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if ch == "/" and sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            j = i + 1
+            while j < n:
+                if sql[j] == quote:
+                    if j + 1 < n and sql[j + 1] == quote:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(sql[i : j + 1])
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _validate_sql_text(sql: Any) -> str:
+    """SQL 文本第一层护栏：单语句、只读起始、关键字/函数黑名单。
+
+    只做「读懂人话」的那一半；结构性拒绝在授权回调与只读连接（见
+    ``_run_sql_readonly``）——三层叠加下漏网也写不动。
+    """
+    if not isinstance(sql, str):
+        raise CustomerDatasetError("sql 必须为字符串")
+    text = sql.strip()
+    if not text:
+        raise CustomerDatasetError("sql 不能为空")
+    if len(text) > SQL_MAX_LENGTH:
+        raise CustomerDatasetError(f"SQL 文本超过上限 {SQL_MAX_LENGTH} 字符")
+    body = _sql_tokens(text).strip().rstrip(";").strip()
+    if ";" in body:
+        raise CustomerDatasetError("SQL 步骤只接受单条语句（检测到分号分隔的多语句）")
+    words = {w.lower() for w in _SQL_WORD_RE.findall(body)}
+    hit = sorted(words & _SQL_FORBIDDEN_WORDS)
+    if hit:
+        raise CustomerDatasetError(
+            "SQL 含被禁语句形态: "
+            + "、".join(w.upper() for w in hit)
+            + "（只读查询，禁 DDL/DML/事务/附加库）"
+        )
+    first = _SQL_WORD_RE.match(body)
+    if first is None or first.group(0).lower() not in ("select", "with"):
+        raise CustomerDatasetError(
+            "SQL 步骤只接受只读查询（语句须以 SELECT 或 WITH 开头）"
+        )
+    for name in sorted(_SQL_FORBIDDEN_FUNCS):
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}\s*\(", body, re.IGNORECASE):
+            raise CustomerDatasetError(
+                f"SQL 调用了被禁函数: {name}（禁扩展加载与文件读写）"
+            )
+    return body
+
+
+def _validate_sql_tables(tables: Any, sql_text: str) -> dict[str, str]:
+    """占位声明对账：``[{name, dataset_key}]`` → ``{name: dataset_key}``。
+
+    未声明却被引用的占位、声明了却没用的占位都如实拒绝（后者防手误：
+    少个字母的声明若被静默忽略，SQL 会在下一层以难懂的方式失败）。
+    """
+    if tables is None:
+        tables = []
+    if not isinstance(tables, list):
+        raise CustomerDatasetError("tables 必须为数组（[{name, dataset_key}]）")
+    mapping: dict[str, str] = {}
+    for item in tables:
+        if not isinstance(item, dict):
+            raise CustomerDatasetError(f"占位声明必须是对象: {item!r}")
+        name = item.get("name")
+        if not isinstance(name, str) or not re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]{0,63}$", name
+        ):
+            raise CustomerDatasetError(
+                f"非法占位名: {name!r}（字母/下划线开头，≤64 字符）"
+            )
+        lowered = name.lower()
+        if lowered in mapping:
+            raise CustomerDatasetError(f"占位名重复: {name!r}（大小写不敏感）")
+        mapping[lowered] = _validate_key(str(item.get("dataset_key") or ""))
+    used = {m.group(1).lower() for m in _SQL_PLACEHOLDER_RE.finditer(
+        _sql_tokens(sql_text)
+    )}
+    undeclared = sorted(used - set(mapping))
+    if undeclared:
+        raise CustomerDatasetError(
+            "SQL 引用了未声明的占位表: "
+            + "、".join("{" + u + "}" for u in undeclared)
+            + "（占位须在 tables 里声明）"
+        )
+    unused = sorted(set(mapping) - used)
+    if unused:
+        raise CustomerDatasetError(
+            "占位声明了但 SQL 未使用: "
+            + "、".join(unused)
+            + "（删掉多余声明，避免拼错却静默失效）"
+        )
+    if not mapping:
+        raise CustomerDatasetError("SQL 步骤至少声明一个占位数据集（tables）")
+    return mapping
+
+
+def _substitute_sql(sql_text: str, mapping: dict[str, str]) -> str:
+    """``{name}`` → 该数据集在该 cell 内的只读目标表名（双引号标识符）。
+
+    刻意**不**建临时视图：占位直接落到 `cust_<key>` 主表，这样执行连接可以
+    保持严格只读（建视图本身要写 temp 库，反而削弱只读强度）。
+    """
+    body = sql_text
+    pieces: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch in ("'", '"'):
+            quote = ch
+            j = i + 1
+            while j < n:
+                if body[j] == quote:
+                    if j + 1 < n and body[j + 1] == quote:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            pieces.append(body[i : j + 1])
+            i = j + 1
+            continue
+        match = _SQL_PLACEHOLDER_RE.match(body, i)
+        if match is not None:
+            target = mapping.get(match.group(1).lower())
+            if target is not None:
+                pieces.append(_quote(_table_name(target)))
+                i = match.end()
+                continue
+        pieces.append(ch)
+        i += 1
+    return "".join(pieces)
+
+
+def _sql_authorizer(allowed_tables: set[str]):
+    """sqlite 授权回调（第二层护栏，结构性）：只放行 SELECT / 对声明表的
+    READ / 非黑名单函数；其余一律 DENY（写、DDL、PRAGMA、ATTACH…）。
+    """
+
+    def _authorize(action, arg1, arg2, dbname, trigger):
+        if action == sqlite3.SQLITE_SELECT:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_READ:
+            table = str(arg1 or "").lower()
+            return sqlite3.SQLITE_OK if table in allowed_tables else sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_FUNCTION:
+            name = str(arg2 or arg1 or "").lower()
+            return (
+                sqlite3.SQLITE_DENY
+                if name in _SQL_FORBIDDEN_FUNCS
+                else sqlite3.SQLITE_OK
+            )
+        if action == sqlite3.SQLITE_RECURSIVE:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    return _authorize
+
+
+def _infer_output_columns(names: list[str], rows: list[tuple]) -> list[dict]:
+    """结果集 → 引擎三型列声明（按样本值推断；空结果一律 TEXT 保守）。"""
+    columns: list[dict] = []
+    for idx, name in enumerate(names):
+        values = [r[idx] for r in rows if r[idx] is not None]
+        if values and all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+            ctype = "INTEGER"
+        elif values and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            ctype = "REAL"
+        else:
+            ctype = "TEXT"
+        columns.append({"name": name, "type": ctype})
+    return columns
+
+
+def _strip_reserved(names: list[str], rows: list[tuple]) -> tuple[list[str], list[tuple]]:
+    """去掉引擎内部保留列（``__row_hash`` 等）：它们是行锚载体，不是客户列。
+
+    ``SELECT *`` 会把主表上的 ``__row_hash`` 一并取出；若原样物化，``_materialize
+    _child_tx`` 会再补一列同名内部列而撞名（duplicate column name）。因此结果
+    集在进入物化前统一剔除保留前缀列——客户的 ``SELECT *`` 语义因此是「取我
+    自己的列」，与 ``preview``/``query`` 的口径一致。
+    """
+    keep = [i for i, n in enumerate(names) if not n.startswith(_RESERVED_COL_PREFIX)]
+    if len(keep) == len(names):
+        return names, rows
+    kept_names = [names[i] for i in keep]
+    kept_rows = [tuple(r[i] for i in keep) for r in rows]
+    return kept_names, kept_rows
+
+
+def _run_sql_readonly(
+    sql_text: str,
+    mapping: dict[str, str],
+    params: Optional[dict],
+    *,
+    limit: Optional[int] = None,
+    truncate: bool = False,
+) -> tuple[list[str], list[dict], list[tuple], bool]:
+    """执行只读 SELECT 子集：三层护栏 + 超时闸 + 行数闸。
+
+    返回 ``(列名, 列声明, 行元组, 是否被截断)``。
+
+    物化路径（``truncate=False``）整批超上限即拒绝——绝不静默截断；试运行
+    （``truncate=True``）按 spec 的「强制 LIMIT 100 预览」语义截断，并把
+    ``truncated`` 如实回传给调用方展示。
+    """
+    bound = _substitute_sql(sql_text, mapping)
+    allowed = {_table_name(key).lower() for key in mapping.values()}
+    # CTE 名不是真实表，但部分 sqlite 版本会把它们报进授权回调的 READ
+    allowed |= {m.group(1).lower() for m in _SQL_CTE_RE.finditer(bound)}
+    bound_params = {
+        str(k): _coerce(v) for k, v in (params or {}).items()
+    }
+    max_rows = _max_rows()
+    cap = max_rows if limit is None else min(int(limit), max_rows)
+    conn = get_database().engine.raw_connection()
+    try:
+        conn.isolation_level = None
+        authorized = False
+        timed_out = False
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            conn.set_authorizer(_sql_authorizer(allowed))
+            authorized = True
+            deadline = time.monotonic() + SQL_TIMEOUT_S
+
+            def _guard() -> int:
+                nonlocal timed_out
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    return 1
+                return 0
+
+            conn.set_progress_handler(_guard, 10_000)
+            cur = conn.cursor()
+            cur.execute(bound, bound_params)
+            names = [d[0] for d in (cur.description or [])]
+            fetched = cur.fetchmany(cap + 1)
+        except sqlite3.DatabaseError as exc:
+            if timed_out:
+                raise CustomerDatasetError(
+                    f"SQL 执行超时（>{SQL_TIMEOUT_S:.0f}s）——请收窄查询范围或加过滤条件"
+                ) from exc
+            raise CustomerDatasetError(f"SQL 执行被拒或失败: {exc}") from exc
+        except sqlite3.ProgrammingError as exc:
+            raise CustomerDatasetError(f"SQL 参数绑定失败: {exc}") from exc
+        finally:
+            try:
+                conn.set_progress_handler(None, 0)
+                if authorized:
+                    conn.set_authorizer(None)
+                conn.execute("PRAGMA query_only = OFF")
+            except Exception:  # noqa: BLE001 - 清理尽力而为，连接随即关闭
+                pass
+    finally:
+        conn.close()
+    truncated = len(fetched) > cap
+    if truncated and not truncate:
+        raise CustomerDatasetError(
+            f"SQL 结果行数超过上限 {cap}（整批拒绝，不静默截断）"
+        )
+    if truncated:
+        fetched = fetched[:cap]
+    names, fetched = _strip_reserved(names, fetched)
+    columns = _infer_output_columns(names, fetched)
+    return names, columns, fetched, truncated
+
+
+def _raw_query_timed(
+    sql: str, params: tuple | list = (), timeout: float = QUERY_TIMEOUT_S
+) -> list[tuple]:
+    """Read with a progress-handler deadline: a query that runs past
+    ``timeout`` seconds aborts and surfaces as an honest domain error instead
+    of pinning the cell's single writer."""
+    conn = get_database().engine.raw_connection()
+    try:
+        deadline = time.monotonic() + float(timeout)
+        timed_out = False
+
+        def _guard() -> int:
+            nonlocal timed_out
+            if time.monotonic() >= deadline:
+                timed_out = True
+                return 1
+            return 0
+
+        conn.set_progress_handler(_guard, 10_000)
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, tuple(params))
+            return cur.fetchall()
+        except sqlite3.OperationalError as exc:
+            if timed_out:
+                raise CustomerDatasetError(
+                    f"查询超时（>{float(timeout):.0f}s），请收窄过滤条件或减少数据量"
+                ) from exc
+            raise
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.close()
+
+
+def _anchor_for(record: dict, row_hash: str, pk_columns: list[str]) -> str:
+    """Row anchor exactly as ``preview`` computes it (pk-first, hash fallback,
+    inserted rows keep their minted ``ins:`` anchor)."""
+    if row_hash.startswith("ins:"):
+        return row_hash
+    if pk_columns:
+        return "pk:" + json.dumps(
+            [record.get(p) for p in pk_columns],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+    return "hash:" + row_hash
+
+
+# ── indicator gateway (§4: platform series via the wire entrance) ────
+
+
+class IndicatorGatewayError(CustomerDatasetError):
+    """The join channel could not resolve or fetch platform indicator data."""
+
+
+JOIN_MAX_CODES = 10
+JOIN_MAX_REGIONS = 64
+
+#: 实体镜像 domain_unavailable 时的规范名回退（v1：仅中国；值经产线
+#: read_range(country/1) 实证可读）
+_CANONICAL_ENTITIES: dict[str, tuple[str, int]] = {"中国": ("country", 1)}
+
+
+def _join_date_periods(value: Any) -> tuple[str, str, str]:
+    """A row date → (exact 'YYYY-MM-DD', month 'YYYY-MM', year 'YYYY').
+    Tolerates TEXT dates stored with a time component."""
+    s = str(value or "")
+    return s[:10], s[:7], s[:4]
+
+
+class _EntranceGateway:
+    """Platform-indicator fetches through the wire entrance (registry), with
+    the cell's own long-lived key — the registry meters those reads to this
+    customer, the same track as artifact materialization (design D4, Q5).
+    HTTP never happens inside a sqlite write transaction (§4 call order)."""
+
+    def __init__(self, url: str, key: str) -> None:
+        self._url = url
+        self._key = key
+
+    def _call(self, tool: str, args: dict) -> Any:
+        import asyncio
+
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
+
+        async def _run() -> Any:
+            transport = StreamableHttpTransport(
+                self._url, headers={"Authorization": f"Bearer {self._key}"}
+            )
+            async with Client(transport) as client:
+                result = await client.call_tool(tool, args)
+            data = getattr(result, "data", None)
+            if data is not None:
+                return data
+            content = getattr(result, "content", None) or []
+            texts = [getattr(item, "text", None) for item in content]
+            texts = [t for t in texts if t is not None]
+            if not texts:
+                return None
+            try:
+                return json.loads(texts[0])
+            except json.JSONDecodeError:
+                return texts[0]
+
+        try:
+            return asyncio.run(_run())
+        except IndicatorGatewayError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — transport/protocol errors, honestly wrapped
+            raise IndicatorGatewayError(
+                f"指标拉取通道调用失败（{tool}）: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def resolve_codes(self, codes: list[str]) -> dict[str, int]:
+        """code → concept_id via the entrance's concept catalog."""
+        concepts = self._call("list_concepts", {})
+        if not isinstance(concepts, list):
+            raise IndicatorGatewayError(f"list_concepts 返回形态异常: {type(concepts).__name__}")
+        by_code: dict[str, int] = {}
+        for c in concepts:
+            if isinstance(c, dict) and c.get("code") and c.get("id") is not None:
+                by_code[str(c["code"])] = int(c["id"])
+        missing = [c for c in codes if c not in by_code]
+        if missing:
+            raise IndicatorGatewayError(f"指标 code 未在目录中解析到: {missing}")
+        return {c: by_code[c] for c in codes}
+
+    def resolve_entity(self, name: str) -> Optional[tuple[str, int]]:
+        """region name → (entity_type, entity_id); None when unresolvable.
+
+        实体镜像（daas_search_entities 的数据面）在部分画像下是
+        domain_unavailable 的合法态（business-mcp 工具文档明示）——此时
+        回退到规范名表（v1：中国 → country/1，PMI 等国家线实测可读）；
+        其余名字如实返回 None（join 该行填 null 并入 unresolved_regions）。
+        """
+        out = self._call("daas_search_entities", {"keyword": name, "limit": 1})
+        if isinstance(out, dict) and out.get("status") == "domain_unavailable":
+            return _CANONICAL_ENTITIES.get(str(name))
+        results = out.get("results") if isinstance(out, dict) else None
+        if not results:
+            return _CANONICAL_ENTITIES.get(str(name))
+        first = results[0]
+        return str(first.get("entity_type", "")), int(first.get("id"))
+
+    def read_range(
+        self, concept_ids: list[int], entity_type: str, entity_id: int, start: str, end: str
+    ) -> dict[int, list[dict]]:
+        out = self._call(
+            "read_range",
+            {
+                "concept_ids": concept_ids,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "start": start,
+                "end": end,
+            },
+        )
+        if not isinstance(out, dict):
+            raise IndicatorGatewayError("read_range 返回形态异常")
+        return {int(k): v for k, v in out.items()}
+
+
+_gateway_factory = None  # tests inject a fake; production leaves this None
+
+
+def _get_indicator_gateway():
+    if _gateway_factory is not None:
+        return _gateway_factory()
+    url = os.environ.get("FD_WIRE_ENTRANCE_URL", "")
+    key = os.environ.get("FD_CELL_WGK_KEY", "")
+    if not url or not key:
+        raise IndicatorGatewayError(
+            "指标拉取通道未配置（FD_WIRE_ENTRANCE_URL / FD_CELL_WGK_KEY），无法执行指标连接派生"
+        )
+    return _EntranceGateway(url, key)
+
+
+def _join_series_index(points: list[dict]) -> dict[str, Any]:
+    """Indicator points → period lookup map. Frequency is inferred from the
+    points' own shape: a point on day-01 contributes its month key (monthly
+    series), a point on Jan-01 contributes its year key (annual series);
+    every point contributes its exact date. Daily series (various days)
+    therefore only match exactly — no neighbor-day bleed. Lookup order at
+    join time is exact → month → year."""
+    index: dict[str, Any] = {}
+    for p in points or []:
+        if not isinstance(p, dict) or p.get("value") is None:
+            continue
+        exact, month, year = _join_date_periods(p.get("date"))
+        index.setdefault(exact, p["value"])
+        if exact[8:10] == "01":
+            index.setdefault(month, p["value"])
+        if exact[5:10] == "01-01":
+            index.setdefault(year, p["value"])
+    return index
 
 
 @contextmanager
@@ -171,6 +928,23 @@ def _raw_query_all(sql: str, params: tuple = ()) -> list[tuple]:
         return cur.fetchall()
     finally:
         conn.close()
+
+
+def _quality_query_all(sql: str) -> list[tuple]:
+    """Dialect-neutral read for the quality snapshot (wire-asset-catalog §3).
+
+    The cell data root may be SQLite or PostgreSQL (wire-cell-postgres-
+    storage storage profile); the write paths above ride the raw sqlite3
+    connection (``?`` placeholders), but the quality SQL must run on both
+    dialects — so it goes through SQLAlchemy ``text()`` on the shared engine
+    (the paramstyle adapts) and is built ONLY from plain standard aggregates
+    (``COUNT(*)``, ``COUNT(DISTINCT col)``, a sampled subquery with
+    ``LIMIT``) plus double-quoted identifiers out of validated dataset
+    metadata. It carries NO bound parameters and no user-supplied fragment
+    can enter the SQL text (the sample limit is a module constant).
+    """
+    with get_database().engine.connect() as conn:
+        return list(conn.execute(sa_text(sql)))
 
 
 def _validate_key(dataset_key: str) -> str:
@@ -220,6 +994,20 @@ def _meta_raw(cur, dataset_key: str) -> Optional[tuple[list, list, Optional[str]
     return columns, pk_columns, row[2]
 
 
+def _ensure_ingest_mode_column(cur) -> None:
+    """Lazy old-database upgrade: ``customer_dataset_ingests.mode`` (replace |
+    merge) did not exist before wire-connector-incremental-sync. First use
+    checks PRAGMA table_info and ALTERs the column in with the 'replace'
+    default — the same lazy pattern as the WAL table and the engine's other
+    additive ALTERs (old rows read back as replace semantics)."""
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(customer_dataset_ingests)")}
+    if cols and "mode" not in cols:
+        cur.execute(
+            "ALTER TABLE customer_dataset_ingests"
+            " ADD COLUMN mode TEXT NOT NULL DEFAULT 'replace'"
+        )
+
+
 class CustomerDatasetService:
     """Thin orchestration over raw SQL: one connection + one transaction per
     mutation (data and metadata together, so swaps stay atomic); ORM session
@@ -249,6 +1037,8 @@ class CustomerDatasetService:
         pk_columns: Optional[list] = None,
         row_count: Optional[int] = None,
         actor: str = "",
+        name: Optional[str] = None,
+        mode: str = "replace",
     ) -> dict:
         dataset_key = _validate_key(dataset_key)
         columns = _validate_columns(columns)
@@ -257,11 +1047,18 @@ class CustomerDatasetService:
         for pk in pk_columns:
             if pk not in col_names:
                 raise CustomerDatasetError(f"主键列不在 columns 中: {pk!r}")
+        mode = str(mode or "replace")
+        if mode not in _INGEST_MODES:
+            raise CustomerDatasetError(f"非法 ingest 模式: {mode!r}（允许 replace/merge）")
+        if mode == "merge" and not pk_columns:
+            raise CustomerDatasetError("merge 模式要求数据集声明主键")
 
         ingest_id = str(uuid.uuid4())
         staging = _table_name(dataset_key, "__staging")
         now = _now_db()
         with _tx() as cur:
+            # old databases predate the mode column — additive lazy ALTER
+            _ensure_ingest_mode_column(cur)
             # any in-flight ingest for this key is superseded
             cur.execute(
                 "UPDATE customer_dataset_ingests SET status='aborted', finished_at=?,"
@@ -284,7 +1081,7 @@ class CustomerDatasetService:
                 "  updated_at=excluded.updated_at",
                 (
                     dataset_key,
-                    dataset_key,
+                    name or dataset_key,
                     json.dumps(columns, ensure_ascii=False),
                     json.dumps(pk_columns, ensure_ascii=False),
                     now,
@@ -292,12 +1089,12 @@ class CustomerDatasetService:
                 ),
             )
             cur.execute(
-                "INSERT INTO customer_dataset_ingests (id, dataset_key, status, row_count, actor, started_at)"
-                " VALUES (?, ?, 'open', ?, ?, ?)",
-                (ingest_id, dataset_key, row_count, actor, now),
+                "INSERT INTO customer_dataset_ingests (id, dataset_key, status, row_count, actor, mode, started_at)"
+                " VALUES (?, ?, 'open', ?, ?, ?, ?)",
+                (ingest_id, dataset_key, row_count, actor, mode, now),
             )
         self._session.expire_all()
-        return {"ingest_id": ingest_id, "staging_table": staging}
+        return {"ingest_id": ingest_id, "staging_table": staging, "mode": mode}
 
     def ingest_chunk(self, ingest_id: str, rows: list, start_index: int) -> dict:
         if not isinstance(rows, list) or not rows:
@@ -335,34 +1132,64 @@ class CustomerDatasetService:
 
     def ingest_commit(self, ingest_id: str) -> dict:
         with _tx() as cur:
+            # old databases predate the mode column — additive lazy ALTER
+            # (also upgrades a row left open by a pre-mode engine build)
+            _ensure_ingest_mode_column(cur)
             found = cur.execute(
-                "SELECT dataset_key, status FROM customer_dataset_ingests WHERE id=?",
+                "SELECT dataset_key, status, mode FROM customer_dataset_ingests WHERE id=?",
                 (ingest_id,),
             ).fetchone()
             if not found:
                 raise CustomerDatasetError(f"ingest 不存在: {ingest_id!r}")
-            dataset_key, status = found
+            dataset_key, status, ingest_mode = found
             if status != "open":
                 raise CustomerDatasetError(f"ingest 状态为 {status}，不能提交")
+            ingest_mode = ingest_mode or "replace"
 
             staging = _table_name(dataset_key, "__staging")
             base = _table_name(dataset_key, "__base")
             effective = _table_name(dataset_key)
-            total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
-            limit = _max_rows()
-            if total > limit:
-                raise CustomerDatasetError(f"行数 {total} 超过上限 {limit}（拒收，旧快照保留）")
 
-            meta = _meta_raw(cur, dataset_key)
-            if meta is None:
-                raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
-            columns, pk_columns, _name = meta
+            if ingest_mode == "merge":
+                # incremental commit: upsert staging into base by pk. The merge
+                # needs the declared columns/pk before touching data; the cap
+                # is judged on the POST-merge total inside the helper.
+                meta = _meta_raw(cur, dataset_key)
+                if meta is None:
+                    raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
+                columns, pk_columns, _name = meta
+                incoming = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
+                total = self._merge_staging_into_base(
+                    cur, staging, base, effective, columns, pk_columns
+                )
+                # provenance: the incremental merge landed — same transaction
+                _wal_append(
+                    cur,
+                    "dataset.incremental.merged",
+                    {"dataset_key": dataset_key, "rows": total, "incoming": int(incoming)},
+                )
+            else:
+                # full snapshot: the staged table atomically replaces the base
+                total = cur.execute(f"SELECT COUNT(*) FROM {_quote(staging)}").fetchone()[0]
+                limit = _max_rows()
+                if total > limit:
+                    raise CustomerDatasetError(f"行数 {total} 超过上限 {limit}（拒收，旧快照保留）")
 
-            # atomic swap: staging → base, then rebuild the effective table
-            cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
-            cur.execute(f'ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}')
-            cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
-            cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
+                meta = _meta_raw(cur, dataset_key)
+                if meta is None:
+                    raise CustomerDatasetError("数据集元数据缺失（begin 未成功登记）")
+                columns, pk_columns, _name = meta
+
+                # atomic swap: staging → base, then rebuild the effective table
+                cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
+                cur.execute(f'ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}')
+                cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
+                cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
+
+                # provenance: the snapshot landed — same transaction as the swap
+                _wal_append(
+                    cur, "dataset.snapshot.refreshed", {"dataset_key": dataset_key, "rows": total}
+                )
 
             replayed, _dangling_now = self._replay_corrections(
                 cur, dataset_key, effective, columns, pk_columns
@@ -392,6 +1219,75 @@ class CustomerDatasetService:
             "corrections_replayed": replayed,
             "corrections_dangling": dangling_total,
         }
+
+    @staticmethod
+    def _merge_staging_into_base(
+        cur, staging: str, base: str, effective: str, columns: list[str], pk_columns: list[str]
+    ) -> int:
+        """merge 提交的数据落地（连接器增量水位同步，wire-connector-incremental
+        §1）：staging 按主键 upsert 进 base —— 既有主键行整行更新（含
+        ``__row_hash``），新主键行插入；staging 未提及的既有行原样保留（源端
+        删除不传播）。base 表没有主键约束（staging 建表只有列+__row_hash），
+        不能用 ``ON CONFLICT``，因此走同一事务内的两步 SQL：UPDATE…FROM
+        （SQLite 3.33+）+ INSERT…SELECT…WHERE NOT EXISTS，标识符全部经
+        ``_quote``。主键为 NULL 的行整批拒绝（口径：NULL 主键不许进 merge）。
+        返回合并后的 base 行数；合并后总数超过 ``_max_rows()`` 时 raise，
+        整事务回滚（零写入，旧数据保留，与 replace 路径超限行为同构）。"""
+        if not pk_columns:
+            raise CustomerDatasetError("merge 模式要求数据集声明主键")
+        # gate 1 — reject NULL primary keys before touching base
+        null_pk = " OR ".join(f"s.{_quote(p)} IS NULL" for p in pk_columns)
+        nulls = int(
+            cur.execute(
+                f"SELECT COUNT(*) FROM {_quote(staging)} AS s WHERE {null_pk}"
+            ).fetchone()[0]
+        )
+        if nulls:
+            raise CustomerDatasetError(
+                f"merge 拒收：staging 有 {nulls} 行主键为 NULL（整批拒绝，base 未动）"
+            )
+        has_base = (
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (base,)
+            ).fetchone()
+            is not None
+        )
+        if not has_base:
+            # first-ever commit for the key — nothing to merge into, so the
+            # incremental window degenerates to the plain snapshot swap
+            cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
+            cur.execute(f'ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}')
+        else:
+            on_chain = " AND ".join(f"b.{_quote(p)} = s.{_quote(p)}" for p in pk_columns)
+            # step 1 — update every existing pk row (all columns + __row_hash)
+            set_exprs = [f"{_quote(c)} = s.{_quote(c)}" for c in columns]
+            set_exprs.append(f'{_quote("__row_hash")} = s.{_quote("__row_hash")}')
+            cur.execute(
+                f"UPDATE {_quote(base)} AS b SET {', '.join(set_exprs)}"
+                f" FROM {_quote(staging)} AS s WHERE {on_chain}"
+            )
+            # step 2 — insert the new pk rows only
+            collist = ", ".join(_quote(c) for c in columns + ["__row_hash"])
+            sellist = ", ".join(f"s.{_quote(c)}" for c in columns + ["__row_hash"])
+            cur.execute(
+                f"INSERT INTO {_quote(base)} ({collist})"
+                f" SELECT {sellist} FROM {_quote(staging)} AS s"
+                f" WHERE NOT EXISTS (SELECT 1 FROM {_quote(base)} AS b WHERE {on_chain})"
+            )
+            # merged data is durably in base — the staging window is spent
+            cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
+        # gate 2 — the row cap judges the POST-merge total
+        total = int(cur.execute(f"SELECT COUNT(*) FROM {_quote(base)}").fetchone()[0])
+        limit = _max_rows()
+        if total > limit:
+            raise CustomerDatasetError(
+                f"合并后行数 {total} 超过上限 {limit}（整事务回滚，旧数据保留）"
+            )
+        # rebuild the effective table from the merged base (corrections are
+        # replayed on top by the caller, inside the same transaction)
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
+        cur.execute(f'CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}')
+        return total
 
     def ingest_abort(self, ingest_id: str) -> dict:
         with _tx() as cur:
@@ -481,10 +1377,18 @@ class CustomerDatasetService:
                 )
             else:
                 dangling += 1
+                reason = reason or _DANGLING_NO_MATCH
                 cur.execute(
                     "UPDATE customer_dataset_corrections"
                     " SET dangling_at=?, dangling_reason=? WHERE id=?",
-                    (_now_db(), reason or _DANGLING_NO_MATCH, cid),
+                    (_now_db(), reason, cid),
+                )
+                # provenance: the correction went dangling in this same
+                # transaction (fires from both ingest_commit and revert paths)
+                _wal_append(
+                    cur,
+                    "dataset.correction.dangling",
+                    {"dataset_key": dataset_key, "correction_id": cid, "reason": reason},
                 )
         return applied, dangling
 
@@ -512,7 +1416,7 @@ class CustomerDatasetService:
 
     def overview(self, dataset_key: str) -> dict:
         meta = self._meta(_validate_key(dataset_key))
-        return meta.to_dict()
+        return {**meta.to_dict(), "capabilities": dict(ENGINE_CAPABILITIES)}
 
     def preview(
         self, dataset_key: str, limit: int = 50, offset: int = 0, include_corrected: bool = True
@@ -532,39 +1436,284 @@ class CustomerDatasetService:
         out_rows = []
         for raw in rows:
             record = {c: raw[i] for i, c in enumerate(columns)}
-            row_hash = str(raw[len(columns)])
-            if row_hash.startswith("ins:"):
-                anchor = row_hash  # inserted rows keep their correction anchor
-            elif pk_columns:
-                anchor = "pk:" + json.dumps(
-                    [record.get(p) for p in pk_columns],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    default=str,
-                )
-            else:
-                anchor = "hash:" + row_hash
-            out_rows.append({**record, "__row_id": anchor})
+            out_rows.append(
+                {**record, "__row_id": _anchor_for(record, str(raw[len(columns)]), pk_columns)}
+            )
         return {
             "columns": meta.columns_json or [{"name": c, "type": "TEXT"} for c in columns],
             "rows": out_rows,
             "total": int(total),
         }
 
-    # ── corrections ──────────────────────────────────────────────────
-
-    def correction_add(
+    def query(
         self,
         dataset_key: str,
-        op: str,
-        anchor: Optional[str],
-        values: Optional[dict],
-        actor: str = "",
+        filters: Optional[list] = None,
+        sort: Optional[list] = None,
+        limit: int = 100,
+        offset: int = 0,
+        count_only: bool = False,
+        distinct_column: Optional[str] = None,
+        raw: bool = False,
     ) -> dict:
+        """Structured query over the effective table (``raw=True`` reads the
+        base snapshot). Filters AND-compose; every operator whitelisted;
+        response rows capped at QUERY_ROW_CAP with an honest ``truncated``
+        flag and the exact ``total``."""
         dataset_key = _validate_key(dataset_key)
         meta = self._meta(dataset_key)
         columns = [c["name"] for c in (meta.columns_json or [])]
         pk_columns = list(meta.pk_columns_json or [])
+        table = _table_name(dataset_key, "__base" if raw else "")
+        where, params = _build_where(filters, columns)
+        where_sql = f" WHERE {where}" if where else ""
+
+        if distinct_column is not None:
+            if distinct_column not in columns:
+                raise CustomerDatasetError(f"去重列不存在: {distinct_column!r}")
+            qcol = _quote(distinct_column)
+            vals = [
+                r[0]
+                for r in _raw_query_timed(
+                    f"SELECT DISTINCT {qcol} FROM {_quote(table)}{where_sql}"
+                    f" ORDER BY 1 LIMIT {QUERY_ROW_CAP}",
+                    params,
+                )
+            ]
+            total = _raw_query_timed(
+                f"SELECT COUNT(DISTINCT {qcol}) FROM {_quote(table)}{where_sql}", params
+            )[0][0]
+            return {
+                "column": distinct_column,
+                "values": vals,
+                "count": int(total),
+                "truncated": int(total) > len(vals),
+            }
+
+        if count_only:
+            total = _raw_query_timed(
+                f"SELECT COUNT(*) FROM {_quote(table)}{where_sql}", params
+            )[0][0]
+            return {"count": int(total)}
+
+        limit = max(1, min(int(limit), QUERY_ROW_CAP))
+        offset = max(0, int(offset))
+        order_sql = _build_order(sort, columns)
+        collist = ", ".join(_quote(c) for c in columns + ["__row_hash"])
+        rows = _raw_query_timed(
+            f"SELECT {collist} FROM {_quote(table)}{where_sql}{order_sql}"
+            f" LIMIT ? OFFSET ?",
+            list(params) + [limit, offset],
+        )
+        total = _raw_query_timed(
+            f"SELECT COUNT(*) FROM {_quote(table)}{where_sql}", params
+        )[0][0]
+        out_rows = []
+        for raw_row in rows:
+            record = {c: raw_row[i] for i, c in enumerate(columns)}
+            out_rows.append(
+                {
+                    **record,
+                    "__row_id": _anchor_for(record, str(raw_row[len(columns)]), pk_columns),
+                }
+            )
+        return {
+            "columns": meta.columns_json or [],
+            "rows": out_rows,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "truncated": int(total) > offset + len(out_rows),
+        }
+
+    def aggregate(
+        self,
+        dataset_key: str,
+        group_by: list,
+        measures: list,
+        filters: Optional[list] = None,
+        raw: bool = False,
+    ) -> dict:
+        """GROUP BY over the effective table (``raw=True`` reads the base
+        snapshot). Measures: count/sum/avg/min/max; sum/avg reject TEXT
+        columns (honest type guard); group rows capped at QUERY_ROW_CAP."""
+        dataset_key = _validate_key(dataset_key)
+        meta = self._meta(dataset_key)
+        col_types = {c["name"]: str(c.get("type", "TEXT")).upper() for c in (meta.columns_json or [])}
+        if not isinstance(group_by, list) or not group_by:
+            raise CustomerDatasetError("group_by 必须为非空数组")
+        for g in group_by:
+            if g not in col_types:
+                raise CustomerDatasetError(f"分组列不存在: {g!r}")
+        if not isinstance(measures, list) or not measures:
+            raise CustomerDatasetError("measures 必须为非空数组")
+        exprs: list[str] = []
+        keys: list[str] = []
+        for m in measures:
+            if not isinstance(m, dict):
+                raise CustomerDatasetError(f"度量必须是对象: {m!r}")
+            func = str(m.get("func", "")).lower()
+            col = m.get("column")
+            if func not in _AGG_FUNCS:
+                raise CustomerDatasetError(f"非法聚合函数: {func!r}（允许 {sorted(_AGG_FUNCS)}）")
+            if func == "count" and col is None:
+                exprs.append("COUNT(*)")
+                keys.append("count")
+                continue
+            if col not in col_types:
+                raise CustomerDatasetError(f"聚合列不存在: {col!r}")
+            if func in ("sum", "avg") and col_types.get(col) == "TEXT":
+                raise CustomerDatasetError(f"{func} 不支持 TEXT 列: {col!r}")
+            exprs.append(f"{func.upper()}({_quote(col)})")
+            keys.append(f"{func}__{col}")
+
+        table = _table_name(dataset_key, "__base" if raw else "")
+        where, params = _build_where(filters, list(col_types))
+        where_sql = f" WHERE {where}" if where else ""
+        group_sql = ", ".join(_quote(g) for g in group_by)
+        measure_sql = ", ".join(exprs)
+        rows = _raw_query_timed(
+            f"SELECT {group_sql}, {measure_sql} FROM {_quote(table)}{where_sql}"
+            f" GROUP BY {group_sql} LIMIT {QUERY_ROW_CAP}",
+            params,
+        )
+        total = _raw_query_timed(
+            f"SELECT COUNT(*) FROM (SELECT 1 FROM {_quote(table)}{where_sql}"
+            f" GROUP BY {group_sql})",
+            params,
+        )[0][0]
+        groups = []
+        for r in rows:
+            rec = {g: r[i] for i, g in enumerate(group_by)}
+            for i, k in enumerate(keys, start=len(group_by)):
+                rec[k] = r[i]
+            groups.append(rec)
+        return {
+            "group_by": group_by,
+            "groups": groups,
+            "group_count": int(total),
+            "truncated": int(total) > len(groups),
+        }
+
+    # ── quality snapshot (wire-asset-catalog §3) ─────────────────────
+
+    def quality(self, dataset_key: str) -> dict:
+        """Quality snapshot over the effective table (wire-asset-catalog §3,
+        engine side — the platform never reads cell data directly, it only
+        receives this aggregate payload): row count, computed_at, primary-key
+        uniqueness ratio and per-column sampled null rates.
+
+        Honesty rules (spec wire-dataset-quality):
+        - a dataset that declares no pk columns gets ``pk_declared=False`` and
+          ``pk_uniqueness=None`` (未声明键列 — no ratio is invented);
+        - null rates are computed on ONE sampled scan capped at
+          ``QUALITY_SAMPLE_ROW_LIMIT`` rows; ``sample_limit_hit`` says whether
+          the cap was hit (≤ cap ⇒ rates are exact);
+        - the effective table is ``cust_<key>`` exactly as the query tools
+          resolve it; a dataset that somehow only has its ``__base`` snapshot
+          is measured on that — honestly, never fabricated.
+
+        Read-only observation: no writes, no WAL events, no new tables.
+
+        Dual dialect (wire-cell-postgres-storage): plain standard aggregates
+        only — COUNT(*) / COUNT(DISTINCT col) / a sampled subquery with
+        LIMIT — no dialect-specific functions (see ``_quality_query_all``).
+
+        PAYLOAD RED LINE: the result carries ONLY aggregate counts/ratios and
+        column/dataset names — it must NEVER contain data values, sample rows
+        or cell contents (the platform stores it verbatim; sampled values are
+        counted in-frame here and then dropped).
+        """
+        dataset_key = _validate_key(dataset_key)
+        meta = self._meta(dataset_key)  # unknown key → 数据集不存在 (same honest error as every read tool)
+        columns = [c["name"] for c in (meta.columns_json or [])]
+        pk_columns = list(meta.pk_columns_json or [])
+
+        # effective-table resolution mirrors preview/query (base + corrections
+        # overlay); existence is checked via the dialect-neutral inspector
+        # (sqlite_master probes are sqlite-only).
+        engine = get_database().engine
+        effective = _table_name(dataset_key)
+        base = _table_name(dataset_key, "__base")
+        if sa_inspect(engine).has_table(effective):
+            table = effective
+        elif sa_inspect(engine).has_table(base):
+            table = base
+        else:
+            raise CustomerDatasetError(f"数据集尚未完成首次提交，没有可读的数据表: {dataset_key!r}")
+        qt = _quote(table)
+
+        row_count = int(_quality_query_all(f"SELECT COUNT(*) FROM {qt}")[0][0])
+
+        # pk uniqueness = COUNT(DISTINCT pk)/COUNT(*). Single-column pk uses
+        # COUNT(DISTINCT col) directly (NULL keys are NOT counted as distinct
+        # — a NULL pk is a quality problem the ratio must not hide); a
+        # composite pk uses the portable DISTINCT-subquery form because
+        # COUNT(DISTINCT a, b) is not standard SQL. A declared-but-empty
+        # table is vacuously unique (no duplicate keys can exist → 1.0).
+        pk_uniqueness: Optional[dict] = None
+        if pk_columns:
+            if len(pk_columns) == 1:
+                distinct = int(
+                    _quality_query_all(
+                        f"SELECT COUNT(DISTINCT {_quote(pk_columns[0])}) FROM {qt}"
+                    )[0][0]
+                )
+            else:
+                pklist = ", ".join(_quote(c) for c in pk_columns)
+                distinct = int(
+                    _quality_query_all(
+                        f"SELECT COUNT(*) FROM (SELECT DISTINCT {pklist} FROM {qt})"
+                    )[0][0]
+                )
+            unique_ratio = (distinct / row_count) if row_count > 0 else 1.0
+            pk_uniqueness = {"columns": pk_columns, "unique_ratio": unique_ratio}
+
+        # per-column null rates on one sampled scan: fetch ONLY the declared
+        # columns (the internal ``__row_hash`` anchor column is hidden from
+        # queries and hidden here too), count NULLs in Python — the values
+        # never leave this frame.
+        collist = ", ".join(_quote(c) for c in columns)
+        sample = _quality_query_all(
+            f"SELECT {collist} FROM {qt} LIMIT {QUALITY_SAMPLE_ROW_LIMIT}"
+        )
+        sampled_rows = len(sample)
+        nulls = [0] * len(columns)
+        for row in sample:
+            for i, value in enumerate(row):
+                if value is None:
+                    nulls[i] += 1
+        null_rates = [
+            {
+                "column": c,
+                "null_rate": (nulls[i] / sampled_rows) if sampled_rows else 0.0,
+                "sampled_rows": sampled_rows,
+            }
+            for i, c in enumerate(columns)
+        ]
+
+        # assertion-style red line: aggregate counts/ratios + names only —
+        # no data values, no sample rows, no cell contents in the payload.
+        return {
+            "dataset_key": dataset_key,
+            "row_count": row_count,
+            "computed_at": _now_wal(),  # ISO-8601 UTC (platform-facing)
+            "pk_declared": bool(pk_columns),
+            "pk_uniqueness": pk_uniqueness,  # None ⇔ 未声明键列
+            "null_rates": null_rates,
+            "sample_limit_hit": row_count > QUALITY_SAMPLE_ROW_LIMIT,
+        }
+
+    # ── corrections ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_edit_op(
+        op: str,
+        anchor: Optional[str],
+        values: Optional[dict],
+        columns: list[str],
+    ) -> tuple[str, dict]:
+        """Shape validation shared by single edits and batch writes."""
         op = (op or "").strip()
         if op not in ("update", "delete", "insert"):
             raise CustomerDatasetError(f"非法修正类型: {op!r}")
@@ -576,79 +1725,223 @@ class CustomerDatasetService:
             raise CustomerDatasetError(f"{op} 修正必须携带行锚")
         if op in ("update", "insert") and not values:
             raise CustomerDatasetError(f"{op} 修正必须携带 values")
+        return op, values
 
+    @staticmethod
+    def _correction_apply_tx(
+        cur,
+        dataset_key: str,
+        columns: list[str],
+        pk_columns: list[str],
+        op: str,
+        anchor: Optional[str],
+        values: dict,
+        actor: str,
+        channel: str,
+        actor_id: Optional[str],
+        actor_label: Optional[str],
+        strict_anchors: bool,
+    ) -> int:
+        """Apply + record ONE overlay edit ON THE CALLER'S OPEN TRANSACTION
+        CURSOR — shared by ``correction_add`` (single) and ``write_batch``
+        (batch), so both channels share identical edit semantics (ADR-0006).
+
+        ``strict_anchors=True`` (batch/business writes): an update/delete that
+        matches no row REJECTS — business writes must hit their anchors;
+        dangling is a connector-world concept, not an app-write outcome.
+        Single console edits keep the record-as-dangling behavior.
+        Returns the minted correction id."""
+        if channel not in _CHANNELS:
+            raise CustomerDatasetError(f"非法写入通道: {channel!r}（允许 {sorted(_CHANNELS)}）")
         effective = _table_name(dataset_key)
         now = _now_db()
+        if op == "update":
+            where, params = _anchor_where(anchor, pk_columns)
+            cur.execute(f"SELECT * FROM {_quote(effective)} WHERE {where} LIMIT 1", params)
+            old = cur.fetchone()
+            old_values = None
+            if old is not None:
+                old_cols = [d[0] for d in cur.description]
+                old_values = {k: v for k, v in zip(old_cols, old) if k != "__row_hash"}
+            sets = ", ".join(f"{_quote(c)} = ?" for c in values)
+            cur.execute(
+                f"UPDATE {_quote(effective)} SET {sets} WHERE {where}",
+                [_coerce(values[c]) for c in values] + list(params),
+            )
+            matched = cur.rowcount
+            if strict_anchors and not matched:
+                raise CustomerDatasetError(f"行锚未命中任何行: {anchor!r}")
+            cur.execute(
+                "INSERT INTO customer_dataset_corrections"
+                " (dataset_key, op, anchor, values_json, old_values_json, actor,"
+                "  channel, actor_id, actor_label, created_at, dangling_at, dangling_reason)"
+                " VALUES (?, 'update', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    dataset_key,
+                    anchor,
+                    json.dumps(values, ensure_ascii=False),
+                    json.dumps(old_values, ensure_ascii=False) if old_values is not None else None,
+                    actor,
+                    channel,
+                    actor_id,
+                    actor_label,
+                    now,
+                    None if matched else now,
+                    None if matched else _DANGLING_NO_MATCH,
+                ),
+            )
+            correction_id = cur.lastrowid
+        elif op == "delete":
+            where, params = _anchor_where(anchor, pk_columns)
+            cur.execute(f"DELETE FROM {_quote(effective)} WHERE {where}", params)
+            matched = cur.rowcount
+            if strict_anchors and not matched:
+                raise CustomerDatasetError(f"行锚未命中任何行: {anchor!r}")
+            cur.execute(
+                "INSERT INTO customer_dataset_corrections"
+                " (dataset_key, op, anchor, actor, channel, actor_id, actor_label,"
+                "  created_at, dangling_at, dangling_reason)"
+                " VALUES (?, 'delete', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    dataset_key,
+                    anchor,
+                    actor,
+                    channel,
+                    actor_id,
+                    actor_label,
+                    now,
+                    None if matched else now,
+                    None if matched else _DANGLING_NO_MATCH,
+                ),
+            )
+            correction_id = cur.lastrowid
+        else:  # insert — two-step to mint ins:<correction_id>
+            cur.execute(
+                "INSERT INTO customer_dataset_corrections"
+                " (dataset_key, op, anchor, values_json, actor, channel, actor_id, actor_label, created_at)"
+                " VALUES (?, 'insert', '', ?, ?, ?, ?, ?, ?)",
+                (
+                    dataset_key,
+                    json.dumps(values, ensure_ascii=False),
+                    actor,
+                    channel,
+                    actor_id,
+                    actor_label,
+                    now,
+                ),
+            )
+            correction_id = cur.lastrowid
+            anchor = f"ins:{correction_id}"
+            cur.execute(
+                "UPDATE customer_dataset_corrections SET anchor=? WHERE id=?",
+                (anchor, correction_id),
+            )
+            collist = ", ".join(_quote(c) for c in values) + f", {_quote('__row_hash')}"
+            placeholders = ", ".join("?" for _ in values) + ", ?"
+            cur.execute(
+                f"INSERT INTO {_quote(effective)} ({collist}) VALUES ({placeholders})",
+                [_coerce(values[c]) for c in values] + [anchor],
+            )
+        # provenance: correction recorded + applied — same transaction.
+        # (For inserts `anchor` is the minted ins:<correction_id> by now.)
+        _wal_append(
+            cur,
+            "dataset.correction.added",
+            {
+                "dataset_key": dataset_key,
+                "op": op,
+                "anchor": anchor,
+                "correction_id": correction_id,
+                "actor": actor,
+                "channel": channel,
+            },
+        )
+        return correction_id
+
+    def correction_add(
+        self,
+        dataset_key: str,
+        op: str,
+        anchor: Optional[str],
+        values: Optional[dict],
+        actor: str = "",
+        channel: str = "console",
+        actor_id: Optional[str] = None,
+        actor_label: Optional[str] = None,
+    ) -> dict:
+        dataset_key = _validate_key(dataset_key)
+        meta = self._meta(dataset_key)
+        columns = [c["name"] for c in (meta.columns_json or [])]
+        pk_columns = list(meta.pk_columns_json or [])
+        op, values = self._validate_edit_op(op, anchor, values, columns)
         with _tx() as cur:
-            if op == "update":
-                where, params = _anchor_where(anchor, pk_columns)
-                cur.execute(f"SELECT * FROM {_quote(effective)} WHERE {where} LIMIT 1", params)
-                old = cur.fetchone()
-                old_values = None
-                if old is not None:
-                    old_cols = [d[0] for d in cur.description]
-                    old_values = {k: v for k, v in zip(old_cols, old) if k != "__row_hash"}
-                sets = ", ".join(f"{_quote(c)} = ?" for c in values)
-                cur.execute(
-                    f"UPDATE {_quote(effective)} SET {sets} WHERE {where}",
-                    [_coerce(values[c]) for c in values] + list(params),
-                )
-                matched = cur.rowcount
-                cur.execute(
-                    "INSERT INTO customer_dataset_corrections"
-                    " (dataset_key, op, anchor, values_json, old_values_json, actor, created_at, dangling_at, dangling_reason)"
-                    " VALUES (?, 'update', ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        dataset_key,
-                        anchor,
-                        json.dumps(values, ensure_ascii=False),
-                        json.dumps(old_values, ensure_ascii=False) if old_values is not None else None,
-                        actor,
-                        now,
-                        None if matched else now,
-                        None if matched else _DANGLING_NO_MATCH,
-                    ),
-                )
-                correction_id = cur.lastrowid
-            elif op == "delete":
-                where, params = _anchor_where(anchor, pk_columns)
-                cur.execute(f"DELETE FROM {_quote(effective)} WHERE {where}", params)
-                matched = cur.rowcount
-                cur.execute(
-                    "INSERT INTO customer_dataset_corrections"
-                    " (dataset_key, op, anchor, actor, created_at, dangling_at, dangling_reason)"
-                    " VALUES (?, 'delete', ?, ?, ?, ?, ?)",
-                    (
-                        dataset_key,
-                        anchor,
-                        actor,
-                        now,
-                        None if matched else now,
-                        None if matched else _DANGLING_NO_MATCH,
-                    ),
-                )
-                correction_id = cur.lastrowid
-            else:  # insert — two-step to mint ins:<correction_id>
-                cur.execute(
-                    "INSERT INTO customer_dataset_corrections"
-                    " (dataset_key, op, anchor, values_json, actor, created_at)"
-                    " VALUES (?, 'insert', '', ?, ?, ?)",
-                    (dataset_key, json.dumps(values, ensure_ascii=False), actor, now),
-                )
-                correction_id = cur.lastrowid
-                anchor = f"ins:{correction_id}"
-                cur.execute(
-                    "UPDATE customer_dataset_corrections SET anchor=? WHERE id=?",
-                    (anchor, correction_id),
-                )
-                collist = ", ".join(_quote(c) for c in values) + f", {_quote('__row_hash')}"
-                placeholders = ", ".join("?" for _ in values) + ", ?"
-                cur.execute(
-                    f"INSERT INTO {_quote(effective)} ({collist}) VALUES ({placeholders})",
-                    [_coerce(values[c]) for c in values] + [anchor],
-                )
+            correction_id = self._correction_apply_tx(
+                cur, dataset_key, columns, pk_columns, op, anchor, values,
+                actor=actor, channel=channel, actor_id=actor_id, actor_label=actor_label,
+                strict_anchors=False,
+            )
         self._session.expire_all()
         return {"correction_id": correction_id}
+
+    def write_batch(
+        self,
+        dataset_key: str,
+        ops: list,
+        actor: str = "",
+        channel: str = "console",
+        actor_id: Optional[str] = None,
+        actor_label: Optional[str] = None,
+    ) -> dict:
+        """Business-write surface: a list of edits applied in ONE transaction
+        (≤1,000 ops); any rejected op rolls the whole batch back with a
+        1-based index pointing at the failing entry. Anchors are strict —
+        an update/delete matching no row rejects the batch."""
+        dataset_key = _validate_key(dataset_key)
+        if not isinstance(ops, list) or not ops:
+            raise CustomerDatasetError("ops 必须为非空数组")
+        if len(ops) > WRITE_BATCH_CAP:
+            raise CustomerDatasetError(f"批量写超过单批上限 {WRITE_BATCH_CAP} 条（收到 {len(ops)}）")
+        meta = self._meta(dataset_key)
+        columns = [c["name"] for c in (meta.columns_json or [])]
+        pk_columns = list(meta.pk_columns_json or [])
+        checked: list[tuple[str, Optional[str], dict]] = []
+        inserts = 0
+        for i, entry in enumerate(ops):
+            if not isinstance(entry, dict):
+                raise CustomerDatasetError(f"第 {i + 1} 条不是对象: {entry!r}")
+            try:
+                op, values = self._validate_edit_op(
+                    entry.get("op"), entry.get("anchor"), entry.get("values"), columns
+                )
+            except CustomerDatasetError as exc:
+                raise CustomerDatasetError(f"第 {i + 1} 条失败: {exc}") from exc
+            if op == "insert":
+                inserts += 1
+            checked.append((op, entry.get("anchor"), values))
+        # 行数上限对批量写同样生效（app 主库场景 insert 累积，不得绕过
+        # ingest_commit 的行数门——wire-customer-datasets 行数上限要求）
+        if inserts:
+            current = _raw_query_one(f"SELECT COUNT(*) FROM {_quote(_table_name(dataset_key))}")[0]
+            limit = _max_rows()
+            if int(current) + inserts > limit:
+                raise CustomerDatasetError(
+                    f"批量写后行数 {int(current) + inserts} 将超过上限 {limit}（整批拒绝）"
+                )
+        with _tx() as cur:
+            correction_ids: list[int] = []
+            for i, (op, anchor, values) in enumerate(checked):
+                try:
+                    correction_ids.append(
+                        self._correction_apply_tx(
+                            cur, dataset_key, columns, pk_columns, op, anchor, values,
+                            actor=actor, channel=channel, actor_id=actor_id,
+                            actor_label=actor_label, strict_anchors=True,
+                        )
+                    )
+                except CustomerDatasetError as exc:
+                    raise CustomerDatasetError(f"第 {i + 1} 条失败: {exc}") from exc
+        self._session.expire_all()
+        return {"applied": len(correction_ids), "correction_ids": correction_ids}
 
     def correction_list(
         self, dataset_key: str, include_reverted: bool = False, include_dangling: bool = True
@@ -699,6 +1992,12 @@ class CustomerDatasetService:
                 "UPDATE customer_dataset_corrections SET reverted_at=? WHERE id=?",
                 (_now_db(), int(correction_id)),
             )
+            # provenance: revert recorded — same transaction
+            _wal_append(
+                cur,
+                "dataset.correction.reverted",
+                {"dataset_key": dataset_key, "correction_id": int(correction_id), "actor": actor},
+            )
             exists = cur.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (base,)
             ).fetchone()
@@ -716,11 +2015,1426 @@ class CustomerDatasetService:
 
     # ── lifecycle ────────────────────────────────────────────────────
 
+    def create_declared(
+        self,
+        dataset_key: str,
+        columns: list,
+        pk_columns: Optional[list] = None,
+        name: Optional[str] = None,
+        actor: str = "",
+        channel: str = "console",
+    ) -> dict:
+        """Schema-declared creation (wire-customer-data-engine task 2.3): an
+        empty dataset built from a column/type/(pk) declaration — the app-first
+        twin of upload/connector creation. Rides the ingest primitives (empty
+        snapshot), so the result is indistinguishable from an uploaded one."""
+        dataset_key = _validate_key(dataset_key)
+        if self._meta(dataset_key, required=False) is not None:
+            raise CustomerDatasetError(f"数据集已存在: {dataset_key!r}")
+        begun = self.ingest_begin(
+            dataset_key, columns, pk_columns=pk_columns, row_count=0, actor=actor, name=name
+        )
+        committed = self.ingest_commit(begun["ingest_id"])
+        return {
+            "dataset_key": dataset_key,
+            "rows": committed.get("rows", 0),
+            "columns": _validate_columns(columns),
+            "pk_columns": list(pk_columns or []),
+        }
+
+    def add_column(self, dataset_key: str, column: dict, actor: str = "") -> dict:
+        """Schema evolution, additive only (task 2.4): one nullable column on
+        the effective + base tables and in the metadata. Destructive changes
+        (drop/retype/rename) are not offered. Rejected while an ingest is
+        open — mid-ingest metadata drift would break chunk column lists."""
+        dataset_key = _validate_key(dataset_key)
+        meta = self._meta(dataset_key)
+        (spec,) = _validate_columns([column])
+        existing = [c["name"] for c in (meta.columns_json or [])]
+        if spec["name"] in existing:
+            raise CustomerDatasetError(f"列已存在: {spec['name']!r}")
+        with _tx() as cur:
+            open_ingest = cur.execute(
+                "SELECT id FROM customer_dataset_ingests WHERE dataset_key=? AND status='open' LIMIT 1",
+                (dataset_key,),
+            ).fetchone()
+            if open_ingest:
+                raise CustomerDatasetError(
+                    "存在进行中的 ingest，请先提交或中止后再加列（避免列清单漂移）"
+                )
+            for suffix in ("", "__base"):
+                cur.execute(
+                    f"ALTER TABLE {_quote(_table_name(dataset_key, suffix))}"
+                    f" ADD COLUMN {_quote(spec['name'])} {spec['type']}"
+                )
+            new_columns = list(meta.columns_json or []) + [spec]
+            cur.execute(
+                "UPDATE customer_datasets SET columns_json=?, updated_at=? WHERE key=?",
+                (json.dumps(new_columns, ensure_ascii=False), _now_db(), dataset_key),
+            )
+            _wal_append(
+                cur,
+                "dataset.schema.column_added",
+                {"dataset_key": dataset_key, "column": spec["name"], "type": spec["type"], "actor": actor},
+            )
+        self._session.expire_all()
+        return {"column": spec, "columns": new_columns}
+
+    # ── derivation & lineage (§3/§4) ─────────────────────────────────
+
+    @staticmethod
+    def _lineage_children(cur, parent_key: str) -> list[str]:
+        """Live (still-existing) derived children of a parent dataset."""
+        rows = cur.execute(
+            "SELECT dataset_key FROM customer_dataset_lineage WHERE parent_key=?",
+            (parent_key,),
+        ).fetchall()
+        live = []
+        for (child,) in rows:
+            if cur.execute(
+                "SELECT 1 FROM customer_datasets WHERE key=?", (child,)
+            ).fetchone():
+                live.append(child)
+        return live
+
+    @staticmethod
+    def _upsert_lineage(
+        cur, child_key: str, parent_key: str, kind: str, spec: dict, status: str, error: Optional[str] = None
+    ) -> None:
+        cur.execute(
+            "INSERT INTO customer_dataset_lineage"
+            " (dataset_key, parent_key, kind, spec_json, status, last_run_at, last_error, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(dataset_key) DO UPDATE SET parent_key=excluded.parent_key,"
+            " kind=excluded.kind, spec_json=excluded.spec_json, status=excluded.status,"
+            " last_run_at=excluded.last_run_at, last_error=excluded.last_error",
+            (
+                child_key,
+                parent_key,
+                kind,
+                json.dumps(spec, ensure_ascii=False),
+                status,
+                _now_db(),
+                error,
+                _now_db(),
+            ),
+        )
+
+    def _materialize_child_tx(
+        self,
+        cur,
+        child_key: str,
+        columns: list[dict],
+        pk_columns: list[str],
+        rows: list[dict],
+        parent_key: str,
+        kind: str,
+        spec: dict,
+        actor: str,
+    ) -> int:
+        """Swap `rows` into the child dataset atomically ON THE CALLER'S OPEN
+        TRANSACTION (source read and child write share one tx — single writer
+        + one transaction = coherent derivation). Oversize results reject the
+        whole operation; the child keeps its previous state."""
+        limit = _max_rows()
+        if len(rows) > limit:
+            raise CustomerDatasetError(
+                f"派生行数 {len(rows)} 超过上限 {limit}（整批拒绝，子集保持原状）"
+            )
+        staging = _table_name(child_key, "__staging")
+        base = _table_name(child_key, "__base")
+        effective = _table_name(child_key)
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(staging)}")
+        col_defs = ", ".join(f"{_quote(c['name'])} {c['type']}" for c in columns)
+        cur.execute(f"CREATE TABLE {_quote(staging)} ({col_defs}, {_quote('__row_hash')} TEXT NOT NULL)")
+        col_names = [c["name"] for c in columns]
+        collist = ", ".join(_quote(c) for c in col_names + ["__row_hash"])
+        placeholders = ", ".join("?" for _ in col_names + ["__row_hash"])
+        cur.executemany(
+            f"INSERT INTO {_quote(staging)} ({collist}) VALUES ({placeholders})",
+            [
+                tuple(_coerce(r.get(c)) for c in col_names) + (_row_hash(col_names, r),)
+                for r in rows
+            ],
+        )
+        total = len(rows)
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(base)}")
+        cur.execute(f"ALTER TABLE {_quote(staging)} RENAME TO {_quote(base)}")
+        cur.execute(f"DROP TABLE IF EXISTS {_quote(effective)}")
+        cur.execute(f"CREATE TABLE {_quote(effective)} AS SELECT * FROM {_quote(base)}")
+        size_bytes = self._size_of(cur, effective)
+        now = _now_db()
+        cur.execute(
+            "INSERT INTO customer_datasets"
+            " (key, name, columns_json, pk_columns_json, row_count, size_bytes, created_at, updated_at, last_commit_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET columns_json=excluded.columns_json,"
+            " pk_columns_json=excluded.pk_columns_json, row_count=excluded.row_count,"
+            " size_bytes=excluded.size_bytes, updated_at=excluded.updated_at,"
+            " last_commit_at=excluded.last_commit_at",
+            (
+                child_key,
+                child_key,
+                json.dumps(columns, ensure_ascii=False),
+                json.dumps(pk_columns, ensure_ascii=False),
+                total,
+                size_bytes,
+                now,
+                now,
+                now,
+            ),
+        )
+        self._upsert_softrefs(cur, child_key)
+        self._upsert_lineage(cur, child_key, parent_key, kind, spec, "ok", None)
+        _wal_append(
+            cur,
+            "dataset.derived",
+            {
+                "dataset_key": child_key,
+                "parent_key": parent_key,
+                "kind": kind,
+                "rows": total,
+                "actor": actor,
+            },
+        )
+        return total
+
+    @staticmethod
+    def _source_rows_and_meta(
+        cur, parent_key: str, filters: Optional[list], sort: Optional[list], limit: Optional[int]
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        """Read the parent's CURRENT effective rows (with declared types) on
+        the caller's cursor. Returns (rows, columns, pk_columns)."""
+        row = cur.execute(
+            "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+            (parent_key,),
+        ).fetchone()
+        if row is None:
+            raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
+        columns = json.loads(row[0]) if row[0] else []
+        pk_columns = list(json.loads(row[1])) if row[1] else []
+        names = [c["name"] for c in columns]
+        where, params = _build_where(filters, names)
+        order_sql = _build_order(sort, names)
+        limit_sql = f" LIMIT {max(1, int(limit))}" if limit else ""
+        collist = ", ".join(_quote(c) for c in names)
+        raw = cur.execute(
+            f"SELECT {collist} FROM {_quote(_table_name(parent_key))}"
+            f"{(' WHERE ' + where) if where else ''}{order_sql}{limit_sql}",
+            params,
+        ).fetchall()
+        rows = [{c: r[i] for i, c in enumerate(names)} for r in raw]
+        return rows, columns, pk_columns
+
+    @staticmethod
+    def _join_key_columns(raw, side: str) -> list[str]:
+        """Join-key normalizer for link: a single column name (the wire
+        entities materialization contract sends exactly that) or a list of
+        names (composite keys). Empty / non-string / duplicate entries are
+        honest structural errors."""
+        if isinstance(raw, str):
+            cols = [raw]
+        elif isinstance(raw, list) and raw and all(isinstance(c, str) for c in raw):
+            cols = list(raw)
+        else:
+            raise CustomerDatasetError(f"{side}连接列须为非空字符串或字符串数组: {raw!r}")
+        if len(set(cols)) != len(cols):
+            raise CustomerDatasetError(f"{side}连接列重复: {cols!r}")
+        return cols
+
+    def derive(
+        self,
+        child_key: str,
+        parent_key: str,
+        filters: Optional[list] = None,
+        sort: Optional[list] = None,
+        limit: Optional[int] = None,
+        actor: str = "",
+        channel: str = "console",
+    ) -> dict:
+        """Query derivation (task 3.2): materialize a structured-query result
+        over one source dataset into a NEW child dataset, lineage recorded."""
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        if child_key == parent_key:
+            raise CustomerDatasetError("派生子集不能与父集相同")
+        spec = {"filters": filters or [], "sort": sort or [], "limit": limit}
+        with _tx() as cur:
+            if cur.execute(
+                "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
+            ).fetchone():
+                raise CustomerDatasetError(f"数据集已存在: {child_key!r}（重派生请用 derive_refresh）")
+            rows, columns, pk_columns = self._source_rows_and_meta(cur, parent_key, filters, sort, limit)
+            total = self._materialize_child_tx(
+                cur, child_key, columns, pk_columns, rows, parent_key, "query", spec, actor
+            )
+        self._session.expire_all()
+        return {"dataset_key": child_key, "rows": total, "kind": "query"}
+
+    def join_indicators(
+        self,
+        child_key: str,
+        parent_key: str,
+        indicators: list,
+        date_column: str,
+        region_column: Optional[str] = None,
+        default_entity: str = "中国",
+        filters: Optional[list] = None,
+        sort: Optional[list] = None,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """Indicator-join derivation (§4): customer rows × platform indicator
+        series. Fetches happen BEFORE the write transaction (HTTP never holds
+        the sqlite writer lock); misses join as NULL — never neighbor values.
+        ``_refresh`` is set by derive_refresh (lineage already verified)."""
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        if child_key == parent_key:
+            raise CustomerDatasetError("派生子集不能与父集相同")
+        if not isinstance(indicators, list) or not indicators:
+            raise CustomerDatasetError("indicators 必须为非空数组")
+        if len(indicators) > JOIN_MAX_CODES:
+            raise CustomerDatasetError(f"单次指标 code 数超过上限 {JOIN_MAX_CODES}")
+
+        # ── resolve codes / entities / series via the gateway (outside tx) ──
+        gateway = _get_indicator_gateway()
+        entries: list[dict] = []
+        codes: list[str] = []
+        for item in indicators:
+            if not isinstance(item, dict):
+                raise CustomerDatasetError(f"indicators 元素必须是对象: {item!r}")
+            code, concept_id = item.get("code"), item.get("concept_id")
+            if code is None and concept_id is None:
+                raise CustomerDatasetError("indicators 元素须携带 code 或 concept_id")
+            alias = item.get("as") or (str(code) if code is not None else f"concept_{concept_id}")
+            if not _COL_RE.match(str(alias)):
+                raise CustomerDatasetError(f"非法输出列名: {alias!r}")
+            if code is not None:
+                codes.append(str(code))
+            entries.append({"code": code, "concept_id": concept_id, "alias": alias})
+        if codes:
+            resolved = gateway.resolve_codes(codes)
+            for e in entries:
+                if e["code"] is not None:
+                    e["concept_id"] = resolved[e["code"]]
+
+        # parent sanity + distinct regions + date span (read-only, no tx)
+        meta = self._meta(parent_key)
+        names = [c["name"] for c in (meta.columns_json or [])]
+        if date_column not in names:
+            raise CustomerDatasetError(f"日期列不存在: {date_column!r}")
+        if region_column is not None and region_column not in names:
+            raise CustomerDatasetError(f"地区列不存在: {region_column!r}")
+        for e in entries:
+            if e["alias"] in names:
+                raise CustomerDatasetError(f"输出列名与源列冲突: {e['alias']!r}")
+        where, params = _build_where(filters, names)
+        where_sql = f" WHERE {where}" if where else ""
+        src = _table_name(parent_key)
+        span = _raw_query_one(
+            f"SELECT MIN({_quote(date_column)}), MAX({_quote(date_column)}) FROM {_quote(src)}{where_sql}",
+            tuple(params),
+        )
+        start, end = (str(span[0])[:10] if span[0] else None, str(span[1])[:10] if span[1] else None)
+
+        entity_keys: dict[Any, tuple[str, int]] = {}
+        unresolved_regions: list[Any] = []
+        if region_column is not None:
+            regions = [
+                r[0]
+                for r in _raw_query_all(
+                    f"SELECT DISTINCT {_quote(region_column)} FROM {_quote(src)}{where_sql}"
+                    f" LIMIT {JOIN_MAX_REGIONS + 1}",
+                    tuple(params),
+                )
+            ]
+            if len(regions) > JOIN_MAX_REGIONS:
+                raise CustomerDatasetError(f"地区去重值超过上限 {JOIN_MAX_REGIONS}，请先收窄过滤")
+            for region in regions:
+                if region is None:
+                    continue
+                resolved = gateway.resolve_entity(str(region))
+                if resolved is None or not resolved[0]:
+                    unresolved_regions.append(region)
+                else:
+                    entity_keys[region] = resolved
+        else:
+            resolved = gateway.resolve_entity(default_entity)
+            if resolved is None or not resolved[0]:
+                raise IndicatorGatewayError(f"默认实体未解析到: {default_entity!r}")
+            entity_keys[default_entity] = resolved
+
+        # fetch series per entity (outside any write tx)
+        concept_ids = sorted({e["concept_id"] for e in entries})
+        series: dict[tuple[str, int], dict[int, dict[str, Any]]] = {}
+        if start and end:
+            for entity_value, (etype, eid) in entity_keys.items():
+                raw = gateway.read_range(concept_ids, etype, eid, start, end)
+                series[(etype, eid)] = {
+                    cid: _join_series_index(points) for cid, points in raw.items()
+                }
+
+        spec = {
+            "filters": filters or [],
+            "sort": sort or [],
+            "indicators": [
+                {"code": e["code"], "concept_id": e["concept_id"], "as": e["alias"]} for e in entries
+            ],
+            "date_column": date_column,
+            "region_column": region_column,
+            "default_entity": default_entity,
+        }
+        with _tx() as cur:
+            if not _refresh and cur.execute(
+                "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
+            ).fetchone():
+                raise CustomerDatasetError(f"数据集已存在: {child_key!r}（重派生请用 derive_refresh）")
+            rows, columns, pk_columns = self._source_rows_and_meta(cur, parent_key, filters, sort, None)
+            out_columns = columns + [{"name": e["alias"], "type": "REAL"} for e in entries]
+            for r in rows:
+                exact, month, year = _join_date_periods(r.get(date_column))
+                entity = (
+                    entity_keys.get(r.get(region_column)) if region_column is not None
+                    else entity_keys.get(default_entity)
+                )
+                for e in entries:
+                    value = None
+                    if entity is not None:
+                        idx = series.get(entity, {}).get(e["concept_id"], {})
+                        value = idx.get(exact)
+                        if value is None:
+                            value = idx.get(month)
+                        if value is None:
+                            value = idx.get(year)
+                    r[e["alias"]] = value
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, pk_columns, rows, parent_key, "join", spec, actor
+            )
+        self._session.expire_all()
+        return {
+            "dataset_key": child_key,
+            "rows": total,
+            "kind": "join",
+            "unresolved_regions": unresolved_regions,
+        }
+
+    def link(
+        self,
+        child_key: str,
+        left_key: str,
+        left_column,
+        right_key: str,
+        right_column,
+        actor: str = "",
+        channel: str = "console",
+        junction_key: str = "",
+        junction_left_column=None,
+        junction_right_column=None,
+        _refresh: bool = False,
+    ) -> dict:
+        """LEFT-JOIN materialization (wire-transform-pipelines §1, design D4 —
+        derive/join skeleton, FROM clause swapped for a two-table LEFT JOIN):
+        child = left LEFT JOIN right on the declared key columns. Left rows
+        are fully preserved; unmatched right columns are NULL. Column-name
+        collisions get the deterministic ``right_`` prefix (right columns
+        whose names are free keep them). One transaction reads both sources
+        and writes the child (same single-writer coherence as derive/join);
+        the join itself is plain standard SQL, dialect-neutral over the
+        cell's SQLite/PostgreSQL data root. ``_refresh`` is set by
+        derive_refresh (lineage already verified).
+
+        m:n 桥展开（wire-entity-mn-materialize design D1/D2）：给出 junction
+        三要素（junction_key + 两侧桥列）时改走**桥行驱动 INNER 对表**——
+        一条桥行一行结果；无桥关联的端点行不入结果（不产全 NULL 伪行）；
+        中间集列不进输出（纯路径）；孤儿桥（引用失存端点的桥行）被 INNER
+        丢弃并以 ``orphan_dropped`` 计数如实上报；子集主键 = 两端主键成对键。
+        同一工具单路径（不建第二物化实现）；junction 缺省时 n:1/1:1 行为
+        逐字节等价。"""
+        child_key = _validate_key(child_key)
+        left_key = _validate_key(left_key)
+        right_key = _validate_key(right_key)
+        junction_mode = bool(
+            junction_key or junction_left_column or junction_right_column
+        )
+        if junction_mode and not (
+            junction_key and junction_left_column and junction_right_column
+        ):
+            raise CustomerDatasetError(
+                "junction 模式须同时提供中间数据集与两侧桥列"
+                "（junction_key / junction_left_column / junction_right_column）"
+            )
+        if child_key in (left_key, right_key, junction_key):
+            raise CustomerDatasetError("派生子集不能与源数据集相同")
+        left_cols = self._join_key_columns(left_column, "左")
+        right_cols = self._join_key_columns(right_column, "右")
+        if len(left_cols) != len(right_cols):
+            raise CustomerDatasetError(
+                f"左右连接列数不匹配: {len(left_cols)} vs {len(right_cols)}"
+            )
+        junction_left_cols: list = []
+        junction_right_cols: list = []
+        if junction_mode:
+            junction_left_cols = self._join_key_columns(junction_left_column, "桥左")
+            junction_right_cols = self._join_key_columns(junction_right_column, "桥右")
+            if len(junction_left_cols) != len(left_cols) or len(
+                junction_right_cols
+            ) != len(right_cols):
+                raise CustomerDatasetError(
+                    f"桥列数须与两侧连接列一致: 桥左 {len(junction_left_cols)}"
+                    f" vs 左 {len(left_cols)}；桥右 {len(junction_right_cols)}"
+                    f" vs 右 {len(right_cols)}"
+                )
+        spec = {"right_key": right_key, "left_columns": left_cols, "right_columns": right_cols}
+        if junction_mode:
+            spec["junction_key"] = junction_key
+            spec["junction_left_columns"] = junction_left_cols
+            spec["junction_right_columns"] = junction_right_cols
+        with _tx() as cur:
+            if not _refresh and cur.execute(
+                "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
+            ).fetchone():
+                raise CustomerDatasetError(f"数据集已存在: {child_key!r}（重派生请用 derive_refresh）")
+            left_meta = cur.execute(
+                "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+                (left_key,),
+            ).fetchone()
+            if left_meta is None:
+                raise CustomerDatasetError(f"左数据集不存在: {left_key!r}")
+            right_meta = cur.execute(
+                "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+                (right_key,),
+            ).fetchone()
+            if right_meta is None:
+                raise CustomerDatasetError(f"右数据集不存在: {right_key!r}")
+            if junction_mode:
+                junction_meta = cur.execute(
+                    "SELECT columns_json FROM customer_datasets WHERE key=?",
+                    (junction_key,),
+                ).fetchone()
+                if junction_meta is None:
+                    raise CustomerDatasetError(f"中间数据集不存在: {junction_key!r}")
+                junction_names = [
+                    c["name"]
+                    for c in (json.loads(junction_meta[0]) if junction_meta[0] else [])
+                    if isinstance(c, dict)
+                ]
+                for c in junction_left_cols + junction_right_cols:
+                    if c not in junction_names:
+                        raise CustomerDatasetError(
+                            f"中间数据集连接列不存在: {c!r}"
+                        )
+            left_columns = json.loads(left_meta[0]) if left_meta[0] else []
+            left_pk = list(json.loads(left_meta[1])) if left_meta[1] else []
+            right_columns = json.loads(right_meta[0]) if right_meta[0] else []
+            right_pk = list(json.loads(right_meta[1])) if right_meta[1] else []
+            left_names = [c["name"] for c in left_columns]
+            right_names = [c["name"] for c in right_columns]
+            for c in left_cols:
+                if c not in left_names:
+                    raise CustomerDatasetError(f"左数据集连接列不存在: {c!r}")
+            for c in right_cols:
+                if c not in right_names:
+                    raise CustomerDatasetError(f"右数据集连接列不存在: {c!r}")
+
+            # Output columns: left columns verbatim, right columns after the
+            # deterministic collision rule (`right_` prefix only on collision;
+            # a prefixed name that still collides is an honest error, never a
+            # silently shadowed column).
+            used = set(left_names)
+            out_columns = list(left_columns)
+            out_right_names: list[str] = []
+            for rc in right_columns:
+                name = rc["name"]
+                out_name = name
+                if out_name in used:
+                    out_name = "right_" + name
+                    if not _COL_RE.match(out_name):
+                        raise CustomerDatasetError(f"输出列名超限: {out_name!r}")
+                    if out_name in used:
+                        raise CustomerDatasetError(f"输出列名冲突: {out_name!r}")
+                used.add(out_name)
+                out_right_names.append(out_name)
+                out_columns.append({"name": out_name, "type": rc["type"]})
+
+            select_parts = [f'l.{_quote(c["name"])}' for c in left_columns]
+            select_parts += [
+                f'r.{_quote(rc["name"])} AS {_quote(out)}'
+                for rc, out in zip(right_columns, out_right_names)
+            ]
+            if junction_mode:
+                # m:n 桥展开（wire-entity-mn-materialize design D1）：桥行驱动
+                # INNER 对表——一条桥行一行结果；无桥关联的端点行不入结果
+                #（不得产出全 NULL 伪行）；中间集列不进输出（纯路径）。
+                on_left = [
+                    f'l.{_quote(a)} = j.{_quote(b)}'
+                    for a, b in zip(left_cols, junction_left_cols)
+                ]
+                on_right = [
+                    f'r.{_quote(a)} = j.{_quote(b)}'
+                    for a, b in zip(right_cols, junction_right_cols)
+                ]
+                sql = (
+                    f"SELECT {', '.join(select_parts)} FROM"
+                    f" {_quote(_table_name(junction_key))} j"
+                    f" JOIN {_quote(_table_name(left_key))} l"
+                    f" ON {' AND '.join(on_left)}"
+                    f" JOIN {_quote(_table_name(right_key))} r"
+                    f" ON {' AND '.join(on_right)}"
+                )
+                junction_total = cur.execute(
+                    f"SELECT COUNT(*) FROM {_quote(_table_name(junction_key))}"
+                ).fetchone()[0]
+            else:
+                on_parts = [
+                    f'l.{_quote(a)} = r.{_quote(b)}' for a, b in zip(left_cols, right_cols)
+                ]
+                sql = (
+                    f"SELECT {', '.join(select_parts)} FROM"
+                    f" {_quote(_table_name(left_key))} l"
+                    f" LEFT JOIN {_quote(_table_name(right_key))} r"
+                    f" ON {' AND '.join(on_parts)}"
+                )
+            raw = cur.execute(sql).fetchall()
+            out_names = [c["name"] for c in out_columns]
+            rows = [{c: r[i] for i, c in enumerate(out_names)} for r in raw]
+            if junction_mode:
+                # 子集主键 = 两端主键成对键（右列撞名走输出名——design D1）；
+                # 右集无主键声明时退化为左主键（与 n:1 同形，如实不加伪键）
+                rename = {
+                    rc["name"]: out
+                    for rc, out in zip(right_columns, out_right_names)
+                }
+                pair_pk = list(left_pk) + [rename.get(c, c) for c in right_pk]
+            else:
+                pair_pk = list(left_pk)
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, pair_pk, rows, left_key, "link", spec, actor
+            )
+        self._session.expire_all()
+        result = {"dataset_key": child_key, "rows": total, "kind": "link"}
+        if junction_mode:
+            # 孤儿桥（引用失存端点的桥行）被 INNER 丢弃——计数如实上报不静默
+            result["orphan_dropped"] = max(junction_total - total, 0)
+        return result
+
+    # ── deterministic operators (wire-transform-operators) ──────────
+    #
+    # 四个算子 + SQL 步骤共享同一条物化路径：一条事务里读源、算、写子集
+    # （``_materialize_child_tx``），血缘 kind = 算子名、spec 存参数——
+    # ``derive_refresh`` 按 kind 原样重放。行数超上限整批拒绝，子集保持原状。
+
+    def _guard_child_key(self, child_key: str, *parents: str, refresh: bool) -> None:
+        """子集 key 校验 + 新建前置（refresh 时跳过存在性检查）。"""
+        if child_key in parents:
+            raise CustomerDatasetError("派生子集不能与源数据集相同")
+        if not refresh and _raw_query_one(
+            "SELECT 1 FROM customer_datasets WHERE key=?", (child_key,)
+        ):
+            raise CustomerDatasetError(
+                f"数据集已存在: {child_key!r}（重派生请用 derive_refresh）"
+            )
+
+    def filter_rows(
+        self,
+        child_key: str,
+        parent_key: str,
+        filters: Optional[list] = None,
+        sort: Optional[list] = None,
+        limit: Optional[int] = None,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """行过滤算子：参数形状与 ``derive`` 完全一致（同一套 filters/sort/
+        limit 语义），区别只在血缘 kind=``filter``——管线步骤因此能在图与
+        运行记录里如实标出「这一步是过滤」而不是笼统的「派生」。"""
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        self._guard_child_key(child_key, parent_key, refresh=_refresh)
+        spec = {"filters": filters or [], "sort": sort or [], "limit": limit}
+        with _tx() as cur:
+            rows, columns, pk_columns = self._source_rows_and_meta(
+                cur, parent_key, filters, sort, limit
+            )
+            total = self._materialize_child_tx(
+                cur, child_key, columns, pk_columns, rows, parent_key, "filter", spec, actor
+            )
+        self._session.expire_all()
+        return {"dataset_key": child_key, "rows": total, "kind": "filter"}
+
+    def project(
+        self,
+        child_key: str,
+        parent_key: str,
+        columns: list,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """投影 + 重命名：``columns=[{source, as?}]``（as 缺省=源列名）。
+
+        输出列序按声明序（这是投影的意义：列序也归客户）。重名 as、未知源列、
+        保留前缀一律 422；主键列若被投影且改了名，子集主键随之改名（不改名则
+        主键丢失会让行锚退化——如实跟随，不静默丢键）。
+        """
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        self._guard_child_key(child_key, parent_key, refresh=_refresh)
+        if not isinstance(columns, list) or not columns:
+            raise CustomerDatasetError("columns 必须为非空数组（[{source, as?}]）")
+        spec = {"columns": columns}
+        with _tx() as cur:
+            parent_meta = cur.execute(
+                "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+                (parent_key,),
+            ).fetchone()
+            if parent_meta is None:
+                raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
+            parent_columns = json.loads(parent_meta[0]) if parent_meta[0] else []
+            parent_pk = list(json.loads(parent_meta[1])) if parent_meta[1] else []
+            types = {c["name"]: c["type"] for c in parent_columns}
+            out_columns: list[dict] = []
+            seen: set[str] = set()
+            rename: dict[str, str] = {}
+            for item in columns:
+                if not isinstance(item, dict):
+                    raise CustomerDatasetError(f"投影项必须是对象: {item!r}")
+                source = item.get("source")
+                if source not in types:
+                    raise CustomerDatasetError(f"投影源列不存在: {source!r}")
+                target = item.get("as") or source
+                if not isinstance(target, str) or not _COL_RE.match(target):
+                    raise CustomerDatasetError(f"非法输出列名: {target!r}")
+                if target.startswith(_RESERVED_COL_PREFIX):
+                    raise CustomerDatasetError(
+                        f"列名不能使用保留前缀 {_RESERVED_COL_PREFIX!r}: {target!r}"
+                    )
+                if target in seen:
+                    raise CustomerDatasetError(f"输出列名重复: {target!r}（每列只能出现一次）")
+                seen.add(target)
+                rename[source] = target
+                out_columns.append({"name": target, "type": types[source]})
+            pk_columns = [rename[c] for c in parent_pk if c in rename]
+            parent_names = [c["name"] for c in parent_columns]
+            raw = cur.execute(
+                f"SELECT {', '.join(_quote(n) for n in parent_names)}"
+                f" FROM {_quote(_table_name(parent_key))}"
+            ).fetchall()
+            rows = []
+            for record in raw:
+                source_row = {n: record[i] for i, n in enumerate(parent_names)}
+                rows.append({rename[s]: source_row[s] for s in rename})
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, pk_columns, rows, parent_key, "project", spec, actor
+            )
+        self._session.expire_all()
+        return {"dataset_key": child_key, "rows": total, "kind": "project"}
+
+    @staticmethod
+    def _aggregate_plan(
+        col_types: dict[str, str], group_by: list, measures: list
+    ) -> tuple[list[str], list[str], list[str], list[dict]]:
+        """聚合计划：校验 + (度量 SQL, 输出键, 输出列声明)。
+
+        与只读 ``aggregate`` 工具同一套语义（操作符/类型守卫同源），但输出
+        是**列声明**（物化要落表），因此独立成纯函数供两条路共用校验口径。
+        """
+        if not isinstance(group_by, list) or not group_by:
+            raise CustomerDatasetError("group_by 必须为非空数组")
+        if len(group_by) > OPERATOR_MAX_GROUP_BY:
+            raise CustomerDatasetError(
+                f"分组列数超过上限 {OPERATOR_MAX_GROUP_BY}（当前 {len(group_by)}）"
+            )
+        if len(set(group_by)) != len(group_by):
+            raise CustomerDatasetError(f"分组列重复: {group_by!r}")
+        for g in group_by:
+            if g not in col_types:
+                raise CustomerDatasetError(f"分组列不存在: {g!r}")
+        if not isinstance(measures, list) or not measures:
+            raise CustomerDatasetError("measures 必须为非空数组")
+        if len(measures) > OPERATOR_MAX_MEASURES:
+            raise CustomerDatasetError(
+                f"度量数超过上限 {OPERATOR_MAX_MEASURES}（当前 {len(measures)}）"
+            )
+        exprs: list[str] = []
+        keys: list[str] = []
+        out_columns = [{"name": g, "type": col_types[g]} for g in group_by]
+        for m in measures:
+            if not isinstance(m, dict):
+                raise CustomerDatasetError(f"度量必须是对象: {m!r}")
+            func = str(m.get("func", "")).lower()
+            col = m.get("column")
+            if func not in _AGG_FUNCS:
+                raise CustomerDatasetError(
+                    f"非法聚合函数: {func!r}（允许 {sorted(_AGG_FUNCS)}）"
+                )
+            if func == "count" and col is None:
+                exprs.append("COUNT(*)")
+                keys.append("count")
+                out_columns.append({"name": "count", "type": "INTEGER"})
+                continue
+            if col not in col_types:
+                raise CustomerDatasetError(f"聚合列不存在: {col!r}")
+            if func in ("sum", "avg") and col_types.get(col) == "TEXT":
+                raise CustomerDatasetError(f"{func} 不支持 TEXT 列: {col!r}")
+            exprs.append(f"{func.upper()}({_quote(col)})")
+            key = f"{func}__{col}"
+            keys.append(key)
+            # count 恒整型；avg 恒浮点；sum/min/max 跟源列类型（sum 的整数列
+            # 在 sqlite 可能溢出成 REAL，声明为 REAL 更诚实——取宽不取窄）
+            out_type = (
+                "INTEGER" if func == "count"
+                else "REAL" if func in ("avg", "sum")
+                else col_types[col]
+            )
+            out_columns.append({"name": key, "type": out_type})
+        if len({c["name"] for c in out_columns}) != len(out_columns):
+            raise CustomerDatasetError(
+                "聚合输出列名重复（分组列与度量名撞名）——请给分组列或度量换列"
+            )
+        return exprs, keys, group_by, out_columns
+
+    def aggregate_derive(
+        self,
+        child_key: str,
+        parent_key: str,
+        group_by: list,
+        measures: list,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """分组聚合算子：把聚合结果**物化**成派生数据集（行=分组、列=度量）。
+
+        与只读 ``customer_dataset_aggregate`` 的区别是产物：那条路返回行不落
+        表（面板查询用），这条落表并可被下游步骤继续加工。两者共用
+        ``_aggregate_plan`` 的校验口径（同一套类型守卫，零第二套语义）。
+        """
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        self._guard_child_key(child_key, parent_key, refresh=_refresh)
+        spec = {"group_by": group_by, "measures": measures}
+        with _tx() as cur:
+            meta = cur.execute(
+                "SELECT columns_json FROM customer_datasets WHERE key=?", (parent_key,)
+            ).fetchone()
+            if meta is None:
+                raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
+            parent_columns = json.loads(meta[0]) if meta[0] else []
+            col_types = {
+                c["name"]: str(c.get("type", "TEXT")).upper() for c in parent_columns
+            }
+            exprs, keys, groups, out_columns = self._aggregate_plan(
+                col_types, group_by, measures
+            )
+            group_sql = ", ".join(_quote(g) for g in groups)
+            raw = cur.execute(
+                f"SELECT {group_sql}, {', '.join(exprs)}"
+                f" FROM {_quote(_table_name(parent_key))} GROUP BY {group_sql}"
+            ).fetchall()
+            out_names = [c["name"] for c in out_columns]
+            rows = [{n: r[i] for i, n in enumerate(out_names)} for r in raw]
+            # 聚合输出无主键（行=分组，主键语义由分组列本身承担）
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, [], rows, parent_key, "aggregate", spec, actor
+            )
+        self._session.expire_all()
+        return {
+            "dataset_key": child_key,
+            "rows": total,
+            "kind": "aggregate",
+            "group_by": groups,
+            "measures": keys,
+        }
+
+    def union(
+        self,
+        child_key: str,
+        left_key: str,
+        right_key: str,
+        on: str = "by_name",
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """按名对齐纵向合并：列集=两侧并集（首现列序），缺列补 NULL。
+
+        同名列类型不兼容（文本 vs 数值）如实拒绝——文本「123」与数值 123
+        合并是脏数据制造机；INTEGER 与 REAL 属同类数值，取宽为 REAL。
+        输出无主键（append 语义）。
+        """
+        child_key = _validate_key(child_key)
+        left_key = _validate_key(left_key)
+        right_key = _validate_key(right_key)
+        self._guard_child_key(child_key, left_key, right_key, refresh=_refresh)
+        if on != "by_name":
+            raise CustomerDatasetError(
+                f"不支持的 union 对齐方式: {on!r}（v1 只支持 on='by_name'）"
+            )
+        spec = {"left_key": left_key, "right_key": right_key, "on": on}
+        numeric = {"INTEGER", "REAL"}
+        with _tx() as cur:
+            sides = []
+            for key in (left_key, right_key):
+                meta = cur.execute(
+                    "SELECT columns_json FROM customer_datasets WHERE key=?", (key,)
+                ).fetchone()
+                if meta is None:
+                    raise CustomerDatasetError(f"数据集不存在: {key!r}")
+                columns = json.loads(meta[0]) if meta[0] else []
+                names = [c["name"] for c in columns]
+                raw = cur.execute(
+                    f"SELECT {', '.join(_quote(n) for n in names)}"
+                    f" FROM {_quote(_table_name(key))}"
+                ).fetchall()
+                sides.append((columns, names, raw))
+            (left_columns, left_names, left_raw), (right_columns, right_names, right_raw) = sides
+            out_columns: list[dict] = []
+            types: dict[str, str] = {}
+            for column in list(left_columns) + list(right_columns):
+                name, ctype = column["name"], str(column.get("type", "TEXT")).upper()
+                if name not in types:
+                    types[name] = ctype
+                    out_columns.append({"name": name, "type": ctype})
+                    continue
+                if types[name] == ctype:
+                    continue
+                if {types[name], ctype} <= numeric:
+                    # 同类数值取宽：INTEGER + REAL → REAL
+                    types[name] = "REAL"
+                    for out in out_columns:
+                        if out["name"] == name:
+                            out["type"] = "REAL"
+                    continue
+                raise CustomerDatasetError(
+                    f"union 同名列类型不兼容: 列 {name!r} 左侧 {types[name]} / 右侧 {ctype}"
+                    "（文本与数值不静默强转——请先统一类型）"
+                )
+            out_names = [c["name"] for c in out_columns]
+            rows: list[dict] = []
+            for names, raw in ((left_names, left_raw), (right_names, right_raw)):
+                for record in raw:
+                    source = {n: record[i] for i, n in enumerate(names)}
+                    rows.append({n: source.get(n) for n in out_names})
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, [], rows, left_key, "union", spec, actor
+            )
+        self._session.expire_all()
+        return {
+            "dataset_key": child_key,
+            "rows": total,
+            "kind": "union",
+            "columns": out_names,
+        }
+
+    @staticmethod
+    def _window_plan(
+        col_types: dict[str, str], partition_by: list, order_by: list, window: list
+    ) -> tuple[list[str], list[dict], list[dict]]:
+        """窗口计划：校验 + (窗口表达式 SQL, 输出列声明, 归一化 window 行)。
+
+        校验矩阵逐条对应 design D1/D2：partition_by 0..10 列 ⊆ 快照、
+        order_by 0..10 `{column, dir}`、window 1..20 行、函数闭集、排序类与
+        lag/lead 必填 order_by、lag/lead offset 1..10000、聚合类 column 校验
+        （count 允许无 column）、``as`` 必填唯一且不与源列撞名、frame 闭集。
+
+        返回的表达式只含**声明列名**与常量 offset——SQL 文本由引擎构造，
+        没有用户 SQL 文本面（因此在 PG 数据根也不需要 SQL 步骤那条
+        fail-closed 护栏，design D4）。
+        """
+        if not isinstance(partition_by, list):
+            raise CustomerDatasetError("partition_by 必须为数组")
+        if len(partition_by) > WINDOW_MAX_PARTITION_BY:
+            raise CustomerDatasetError(
+                f"分区列数超过上限 {WINDOW_MAX_PARTITION_BY}（当前 {len(partition_by)}）"
+            )
+        if len(set(partition_by)) != len(partition_by):
+            raise CustomerDatasetError(f"分区列重复: {partition_by!r}")
+        for col in partition_by:
+            if not isinstance(col, str) or col not in col_types:
+                raise CustomerDatasetError(f"分区列不存在: {col!r}")
+        if not isinstance(order_by, list):
+            raise CustomerDatasetError("order_by 必须为数组")
+        if len(order_by) > WINDOW_MAX_ORDER_BY:
+            raise CustomerDatasetError(
+                f"排序列数超过上限 {WINDOW_MAX_ORDER_BY}（当前 {len(order_by)}）"
+            )
+        order_parts: list[str] = []
+        order_cols: list[str] = []
+        for item in order_by:
+            if not isinstance(item, dict):
+                raise CustomerDatasetError(f"排序项必须是对象: {item!r}")
+            col = item.get("column")
+            direction = str(item.get("dir", "asc")).lower()
+            if not isinstance(col, str) or col not in col_types:
+                raise CustomerDatasetError(f"排序列不存在: {col!r}")
+            if direction not in ("asc", "desc"):
+                raise CustomerDatasetError(f"非法排序方向: {direction!r}（允许 asc/desc）")
+            if col in order_cols:
+                raise CustomerDatasetError(f"排序列重复: {col!r}")
+            order_cols.append(col)
+            order_parts.append(f"{_quote(col)} {direction.upper()}")
+        # design D2：内部 ORDER BY 末尾追加稳定行键，作并列的最终 tie-break
+        # （重派生逐行一致）。该列只参与排序，绝不进输出列。
+        #
+        # 例外（rank/dense_rank）：它们的语义就是「并列同名次」，把
+        # __row_hash 塞进它们的 OVER ORDER BY 会消灭并列、退化成
+        # row_number。故 rank/dense_rank 用**声明键序**（值本身确定，并列
+        # 行名次相同，无需 tie-break），其余行序敏感函数用键序+行键。
+        keys_order_sql = ", ".join(order_parts)
+        tiebreak_order_sql = ", ".join(
+            order_parts + [f"{_quote(WINDOW_TIEBREAK_COL)} ASC"]
+        )
+        partition_sql = (
+            "PARTITION BY " + ", ".join(_quote(c) for c in partition_by)
+            if partition_by
+            else ""
+        )
+        has_order = bool(order_parts)
+        if not isinstance(window, list) or not window:
+            raise CustomerDatasetError("window 必须为非空数组（[{func, column?, offset?, as}]）")
+        if len(window) > WINDOW_MAX_ROWS:
+            raise CustomerDatasetError(
+                f"窗口行数超过上限 {WINDOW_MAX_ROWS}（当前 {len(window)}）"
+            )
+        out_columns = [{"name": n, "type": t} for n, t in col_types.items()]
+        source_names = set(col_types)
+        seen_as: set[str] = set()
+        exprs: list[str] = []
+        normalized: list[dict] = []
+        for item in window:
+            if not isinstance(item, dict):
+                raise CustomerDatasetError(f"窗口行必须是对象: {item!r}")
+            func = str(item.get("func", "")).lower()
+            if func not in WINDOW_FUNCS:
+                raise CustomerDatasetError(
+                    f"非法窗口函数: {func!r}（允许 {sorted(WINDOW_FUNCS)}）"
+                )
+            alias = item.get("as")
+            if not isinstance(alias, str) or not _COL_RE.match(alias):
+                raise CustomerDatasetError(f"window 行缺少合法输出列名 as: {alias!r}")
+            if alias.startswith(_RESERVED_COL_PREFIX):
+                raise CustomerDatasetError(
+                    f"列名不能使用保留前缀 {_RESERVED_COL_PREFIX!r}: {alias!r}"
+                )
+            if alias in source_names:
+                raise CustomerDatasetError(
+                    f"window 输出列名与源列名冲突: {alias!r}（请换一个 as，不静默改名）"
+                )
+            if alias in seen_as:
+                raise CustomerDatasetError(
+                    f"window 输出列名重复: {alias!r}（每行 as 必须唯一）"
+                )
+            seen_as.add(alias)
+            frame = str(item.get("frame") or "whole_partition").lower()
+            if frame not in WINDOW_FRAMES:
+                raise CustomerDatasetError(
+                    f"非法 frame: {frame!r}（允许 {sorted(WINDOW_FRAMES)}）"
+                )
+            if frame == "running" and not has_order:
+                raise CustomerDatasetError(
+                    "frame=running 需要 order_by（累积帧必须有确定行序）"
+                )
+            col = item.get("column")
+            offset = item.get("offset")
+            normalized.append({"func": func, "column": col, "offset": offset, "as": alias, "frame": frame})
+            if func in WINDOW_RANKING_FUNCS:
+                if col is not None:
+                    raise CustomerDatasetError(f"{func} 不接受 column（它只对行序编号）")
+                if not has_order:
+                    raise CustomerDatasetError(f"{func} 需要 order_by（排序类窗口函数）")
+                expr, out_type = f"{func.upper()}()", "INTEGER"
+                # rank/dense_rank：声明键序（保留并列语义）；row_number：
+                # 键序+行键（并列行的编号确定且可重放）。
+                over_parts = [
+                    partition_sql,
+                    "ORDER BY "
+                    + (
+                        keys_order_sql
+                        if func in ("rank", "dense_rank")
+                        else tiebreak_order_sql
+                    ),
+                ]
+            elif func in WINDOW_OFFSET_FUNCS:
+                if col not in col_types:
+                    raise CustomerDatasetError(f"{func} 的 column 不存在: {col!r}")
+                if not has_order:
+                    raise CustomerDatasetError(f"{func} 需要 order_by（前后行依赖确定行序）")
+                if offset is None:
+                    offset = 1
+                if isinstance(offset, bool) or not isinstance(offset, int):
+                    raise CustomerDatasetError(f"{func} 的 offset 必须为整数: {offset!r}")
+                if not 1 <= offset <= WINDOW_MAX_OFFSET:
+                    raise CustomerDatasetError(
+                        f"{func} 的 offset 必须在 1..{WINDOW_MAX_OFFSET} 之间（当前 {offset}）"
+                    )
+                expr, out_type = f"{func.upper()}({_quote(col)}, {offset})", col_types[col]
+                over_parts = [partition_sql, "ORDER BY " + tiebreak_order_sql]
+                normalized[-1]["offset"] = offset
+            else:
+                # 聚合类（sum/avg/min/max/count）
+                if offset is not None:
+                    raise CustomerDatasetError(f"{func} 不接受 offset（只有 lag/lead 接受）")
+                if func == "count" and col is None:
+                    expr = "COUNT(*)"
+                else:
+                    if col not in col_types:
+                        raise CustomerDatasetError(f"{func} 的 column 不存在: {col!r}")
+                    # 与 aggregate_derive 同一套类型守卫：TEXT 求和/求均值会
+                    # 被 sqlite 静默当 0 处理（脏数据制造机），如实拒绝。
+                    if func in ("sum", "avg") and col_types.get(col) == "TEXT":
+                        raise CustomerDatasetError(f"{func} 不支持 TEXT 列: {col!r}")
+                    expr = f"{func.upper()}({_quote(col)})"
+                # 类型纪律（design D4）：count 恒 INTEGER、avg 恒 REAL、
+                # sum/min/max 沿源列类型。
+                out_type = (
+                    "INTEGER"
+                    if func == "count"
+                    else "REAL"
+                    if func == "avg"
+                    else col_types[col]
+                )
+                if frame == "running":
+                    over_parts = [
+                        partition_sql,
+                        "ORDER BY " + tiebreak_order_sql,
+                        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                    ]
+                else:
+                    # whole_partition：整分区聚合（无 ORDER BY = 无累积语义）
+                    over_parts = [partition_sql]
+            over = " ".join(p for p in over_parts if p)
+            exprs.append(f"{expr} OVER ({over}) AS {_quote(alias)}")
+            out_columns.append({"name": alias, "type": out_type})
+        return exprs, out_columns, normalized
+
+    def window_rows(
+        self,
+        child_key: str,
+        parent_key: str,
+        partition_by: Optional[list] = None,
+        order_by: Optional[list] = None,
+        window: Optional[list] = None,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """窗口算子：单数据集分区/排序窗口计算 → NEW 派生数据集。
+
+        语义（design D1–D3）：输出=源列原样 + 每个 window 行一列（按 ``as``），
+        行数与源一致（窗口不改行集，行数闸=单数据集上限，超限整批拒绝）；
+        血缘 kind=``window``，spec 存完整参数（含 frame 与 tie-break 说明），
+        ``derive_refresh`` 按 spec 重放。并列排序以内部稳定行键
+        ``__row_hash`` 作最终 tie-break，重派生逐行一致；``__row_hash`` 与
+        保留前缀列绝不进输出列（复用 SQL 步骤的 ``_strip_reserved`` 纪律，
+        不新造第二套剔除逻辑）。
+        """
+        child_key = _validate_key(child_key)
+        parent_key = _validate_key(parent_key)
+        self._guard_child_key(child_key, parent_key, refresh=_refresh)
+        partition_by = [] if partition_by is None else partition_by
+        order_by = [] if order_by is None else order_by
+        with _tx() as cur:
+            meta = cur.execute(
+                "SELECT columns_json, pk_columns_json FROM customer_datasets WHERE key=?",
+                (parent_key,),
+            ).fetchone()
+            if meta is None:
+                raise CustomerDatasetError(f"父数据集不存在: {parent_key!r}")
+            parent_columns = json.loads(meta[0]) if meta[0] else []
+            pk_columns = list(json.loads(meta[1])) if meta[1] else []
+            col_types = {
+                c["name"]: str(c.get("type", "TEXT")).upper() for c in parent_columns
+            }
+            exprs, out_columns, normalized = self._window_plan(
+                col_types, partition_by, order_by, window
+            )
+            spec = {
+                "partition_by": list(partition_by),
+                "order_by": list(order_by),
+                "window": normalized,
+                "tiebreak": WINDOW_TIEBREAK_COL,
+            }
+            src_names = [c["name"] for c in parent_columns]
+            aliases = [w["as"] for w in normalized]
+            # 输出=源列+各窗口列；内部行键一并取出后由 _strip_reserved 剔除
+            # （它既不进输出列，也不会与物化层补写的 __row_hash 撞名）。
+            select_sql = ", ".join(
+                [_quote(n) for n in src_names]
+                + exprs
+                + [_quote(WINDOW_TIEBREAK_COL)]
+            )
+            order_sql = ""
+            if order_by:
+                # 输出行序与窗口行序同源（含 tie-break），重派生逐行一致。
+                order_sql = " ORDER BY " + ", ".join(
+                    f"{_quote(str(o['column']))} {str(o.get('dir', 'asc')).upper()}"
+                    for o in order_by
+                ) + f", {_quote(WINDOW_TIEBREAK_COL)} ASC"
+            else:
+                # 无排序列（如整分区聚合）：仍按稳定行键输出，重派生行序一致。
+                order_sql = f" ORDER BY {_quote(WINDOW_TIEBREAK_COL)} ASC"
+            raw = cur.execute(
+                f"SELECT {select_sql} FROM {_quote(_table_name(parent_key))}{order_sql}"
+            ).fetchall()
+            names = src_names + aliases + [WINDOW_TIEBREAK_COL]
+            names, raw = _strip_reserved(names, raw)
+            rows = [{n: r[i] for i, n in enumerate(names)} for r in raw]
+            # 主键原样随源列通过（窗口不重命名、不丢键）；无源主键则无子集主键
+            total = self._materialize_child_tx(
+                cur, child_key, out_columns, pk_columns, rows, parent_key, "window", spec, actor
+            )
+        self._session.expire_all()
+        return {
+            "dataset_key": child_key,
+            "rows": total,
+            "kind": "window",
+            "columns": [c["name"] for c in out_columns],
+        }
+
+    def sql_query(
+        self,
+        sql_text: str,
+        tables: list,
+        params: Optional[dict] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """SQL 试运行：同一执行器 + 强制 LIMIT 预览，**不创建/刷新任何数据集**。
+
+        返回值带 ``preview=True``——调用方（api）据此绝不登记子集。
+        """
+        body = _validate_sql_text(sql_text)
+        mapping = _validate_sql_tables(tables, body)
+        cap = SQL_PREVIEW_LIMIT if limit is None else min(int(limit), SQL_PREVIEW_LIMIT)
+        names, columns, fetched, truncated = _run_sql_readonly(
+            body, mapping, params, limit=cap, truncate=True
+        )
+        return {
+            "preview": True,
+            "columns": columns,
+            "rows": [
+                {n: r[i] for i, n in enumerate(names)} for r in fetched
+            ],
+            "row_count": len(fetched),
+            "limit": cap,
+            "truncated": truncated,
+        }
+
+    def sql_derive(
+        self,
+        child_key: str,
+        sql_text: str,
+        tables: list,
+        params: Optional[dict] = None,
+        actor: str = "",
+        channel: str = "console",
+        _refresh: bool = False,
+    ) -> dict:
+        """SQL 步骤物化：只读 SELECT 子集 → 派生数据集。
+
+        血缘 spec 存 SQL 文本 + 占位映射 + 参数（append-only，可重放可审计）；
+        重放走 ``derive_refresh`` 的 ``sql`` 分支，原样重执行。父集=第一个占位
+        数据集（血缘图的主父；其余占位在 spec.tables 里完整留档）。
+        """
+        child_key = _validate_key(child_key)
+        body = _validate_sql_text(sql_text)
+        mapping = _validate_sql_tables(tables, body)
+        for key in mapping.values():
+            _validate_key(key)
+        self._guard_child_key(child_key, *mapping.values(), refresh=_refresh)
+        spec = {
+            "sql": body,
+            "tables": [{"name": n, "dataset_key": k} for n, k in mapping.items()],
+            "params": dict(params or {}),
+        }
+        names, columns, fetched, _truncated = _run_sql_readonly(body, mapping, params)
+        rows = [{n: r[i] for i, n in enumerate(names)} for r in fetched]
+        parent_key = next(iter(mapping.values()))
+        with _tx() as cur:
+            total = self._materialize_child_tx(
+                cur, child_key, columns, [], rows, parent_key, "sql", spec, actor
+            )
+        self._session.expire_all()
+        return {
+            "dataset_key": child_key,
+            "rows": total,
+            "kind": "sql",
+            "columns": [c["name"] for c in columns],
+        }
+
+    def derive_refresh(self, child_key: str, actor: str = "") -> dict:
+        """Re-run a derived dataset's stored spec against the parent's current
+        effective state (task 3.3). Join derivations re-fetch series first;
+        link derivations rebuild their LEFT JOIN from the current left/right
+        contents (design D4 — one refresh entry, dispatched by lineage kind)."""
+        child_key = _validate_key(child_key)
+        lin = _raw_query_one(
+            "SELECT parent_key, kind, spec_json FROM customer_dataset_lineage WHERE dataset_key=?",
+            (child_key,),
+        )
+        if lin is None:
+            raise CustomerDatasetError(f"不是派生数据集: {child_key!r}")
+        parent_key, kind, spec_json = lin
+        spec = json.loads(spec_json) if spec_json else {}
+        if kind == "link":
+            # replay the stored link spec against the CURRENT left/right
+            # contents; a missing left or right source is an honest error
+            # raised inside the (rolled back) transaction — the child keeps
+            # its previous state, never a fabricated empty result
+            result = self.link(
+                child_key,
+                parent_key,  # lineage parent = the left dataset
+                left_column=spec.get("left_columns", []),
+                right_key=spec.get("right_key", ""),
+                right_column=spec.get("right_columns", []),
+                junction_key=spec.get("junction_key", ""),
+                junction_left_column=spec.get("junction_left_columns", []),
+                junction_right_column=spec.get("junction_right_columns", []),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "join":
+            result = self.join_indicators(
+                child_key,
+                parent_key,
+                indicators=spec.get("indicators", []),
+                date_column=spec.get("date_column", ""),
+                region_column=spec.get("region_column"),
+                default_entity=spec.get("default_entity", "中国"),
+                filters=spec.get("filters"),
+                sort=spec.get("sort"),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        # ── 确定性算子 / SQL 步骤重放（wire-transform-operators）──────
+        # 按血缘 kind 原样重放存档参数；参数形状与首次创建完全一致（同一份
+        # spec），因此重放结果可复现——输出槽位原地刷新由调用方保证。
+        if kind == "filter":
+            result = self.filter_rows(
+                child_key,
+                parent_key,
+                filters=spec.get("filters"),
+                sort=spec.get("sort"),
+                limit=spec.get("limit"),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "project":
+            result = self.project(
+                child_key,
+                parent_key,
+                columns=spec.get("columns", []),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "aggregate":
+            result = self.aggregate_derive(
+                child_key,
+                parent_key,
+                group_by=spec.get("group_by", []),
+                measures=spec.get("measures", []),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "union":
+            result = self.union(
+                child_key,
+                parent_key,
+                spec.get("right_key", ""),
+                on=spec.get("on", "by_name"),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "window":
+            result = self.window_rows(
+                child_key,
+                parent_key,
+                partition_by=spec.get("partition_by", []),
+                order_by=spec.get("order_by", []),
+                window=spec.get("window", []),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        if kind == "sql":
+            result = self.sql_derive(
+                child_key,
+                spec.get("sql", ""),
+                tables=spec.get("tables", []),
+                params=spec.get("params"),
+                actor=actor,
+                _refresh=True,
+            )
+            result["refreshed"] = True
+            return result
+        with _tx() as cur:
+            rows, columns, pk_columns = self._source_rows_and_meta(
+                cur, parent_key, spec.get("filters"), spec.get("sort"), spec.get("limit")
+            )
+            total = self._materialize_child_tx(
+                cur, child_key, columns, pk_columns, rows, parent_key, "query", spec, actor
+            )
+        self._session.expire_all()
+        return {"dataset_key": child_key, "rows": total, "kind": "query", "refreshed": True}
+
+    def lineage(self, dataset_key: str) -> dict:
+        """Lineage rows where this dataset is the child (its derivation) —
+        parents are discovered by scanning children rows."""
+        dataset_key = _validate_key(dataset_key)
+        self._meta(dataset_key)
+        own = _raw_query_all(
+            "SELECT dataset_key, parent_key, kind, spec_json, status, last_run_at, last_error, created_at"
+            " FROM customer_dataset_lineage WHERE dataset_key=?",
+            (dataset_key,),
+        )
+        children = _raw_query_all(
+            "SELECT dataset_key, kind, status FROM customer_dataset_lineage WHERE parent_key=?",
+            (dataset_key,),
+        )
+        return {
+            "derivation": [
+                {
+                    "parent_key": r[1],
+                    "kind": r[2],
+                    "spec": json.loads(r[3]) if r[3] else {},
+                    "status": r[4],
+                    "last_run_at": r[5],
+                    "last_error": r[6],
+                }
+                for r in own
+            ],
+            "children": [
+                {"dataset_key": r[0], "kind": r[1], "status": r[2]} for r in children
+            ],
+        }
+
     def delete(self, dataset_key: str, actor: str = "") -> dict:
         dataset_key = _validate_key(dataset_key)
         name = _table_name(dataset_key)
         now = _now_db()
         with _tx() as cur:
+            # §3.1: live derived children block deletion — an orphaned lineage
+            # would leave an unexplainable hole in the audit chain
+            live_children = self._lineage_children(cur, dataset_key)
+            if live_children:
+                raise CustomerDatasetError(
+                    f"存在活跃派生子集，删除被阻止: {live_children}"
+                )
             for suffix in ("", "__base", "__staging"):
                 cur.execute(f"DROP TABLE IF EXISTS {_quote(_table_name(dataset_key, suffix))}")
             cur.execute(
@@ -729,9 +3443,14 @@ class CustomerDatasetService:
                 (str(uuid.uuid4()), dataset_key, now, now, actor, "dataset deleted"),
             )
             cur.execute("DELETE FROM customer_dataset_corrections WHERE dataset_key=?", (dataset_key,))
+            # a deleted child takes its own lineage row with it
+            cur.execute("DELETE FROM customer_dataset_lineage WHERE dataset_key=?", (dataset_key,))
             cur.execute("DELETE FROM customer_datasets WHERE key=?", (dataset_key,))
             cur.execute("DELETE FROM sources WHERE name=?", (name,))
             cur.execute("DELETE FROM datasources WHERE name=?", (name,))
+            # provenance: the dataset is gone but its WAL row survives this
+            # transaction — the deleted event is exactly what the ledger wants
+            _wal_append(cur, "dataset.deleted", {"dataset_key": dataset_key, "actor": actor})
         self._session.expire_all()
         return {"deleted": True}
 
@@ -757,6 +3476,7 @@ def ingest_begin(
     pk_columns: Optional[list] = None,
     row_count: Optional[int] = None,
     actor: str = "",
+    mode: str = "replace",
 ) -> dict:
     """Begin a full-snapshot ingest for a customer dataset (registers/refreshes
     the dataset metadata and creates the staging table). Supersedes any
@@ -768,10 +3488,24 @@ def ingest_begin(
         pk_columns: Optional primary-key column names (row anchor: pk-first).
         row_count: Optional expected total row count (informational).
         actor: Who initiated the ingest (audit).
+        mode: Commit semantics: `replace` (default — the staged snapshot
+            atomically replaces the base) or `merge` (incremental — the staged
+            rows are upserted into the base by pk_columns; requires pk_columns;
+            rows absent from staging are kept, so source-side deletes never
+            propagate).
     """
     svc = _svc()
     try:
-        return _ok(svc.ingest_begin(dataset_key, columns, pk_columns=pk_columns, row_count=row_count, actor=actor))
+        return _ok(
+            svc.ingest_begin(
+                dataset_key,
+                columns,
+                pk_columns=pk_columns,
+                row_count=row_count,
+                actor=actor,
+                mode=mode,
+            )
+        )
     except Exception as e:
         return _err(e)
 
@@ -787,9 +3521,12 @@ def ingest_chunk(ingest_id: str, rows: list, start_index: int) -> dict:
 
 
 def ingest_commit(ingest_id: str) -> dict:
-    """Atomically swap the staged snapshot into the base table, rebuild the
-    effective table and replay all active corrections (dangling anchors are
-    marked, never dropped). Returns rows/size/corrections stats."""
+    """Commit an open ingest per its begin-time mode: `replace` atomically
+    swaps the staged snapshot into the base table; `merge` upserts the staged
+    rows into the base by the dataset's primary key (rows absent from staging
+    are kept). Either way the effective table is rebuilt and all active
+    corrections replayed (dangling anchors are marked, never dropped). Returns
+    rows/size/corrections stats."""
     svc = _svc()
     try:
         return _ok(svc.ingest_commit(ingest_id))
@@ -827,14 +3564,646 @@ def preview(
         return _err(e)
 
 
-def correction_add(
-    dataset_key: str, op: str, anchor: Optional[str] = None, values: Optional[dict] = None, actor: str = ""
+def query(
+    dataset_key: str,
+    filters: Optional[list] = None,
+    sort: Optional[list] = None,
+    limit: int = 100,
+    offset: int = 0,
+    count_only: bool = False,
+    distinct_column: Optional[str] = None,
+    raw: bool = False,
 ) -> dict:
-    """Add an overlay correction (update/delete/insert); it applies to the
-    effective table immediately and is replayed after every future commit."""
+    """Structured query over a customer dataset: whitelisted filter operators
+    (eq/ne/gt/gte/lt/lte/in/notin/like/isnull/notnull, AND-composed), multi-column
+    sort, limit/offset paging, exact total and an honest truncated flag; rows
+    carry `__row_id` anchors. `count_only=True` returns just the count;
+    `distinct_column` returns that column's distinct values (capped at 1,000);
+    `raw=True` reads the base snapshot without edits. Responses are capped at
+    1,000 rows and queries abort past 5s.
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+        filters: `[{column, op, value | values}]` — values only for in/notin.
+        sort: `[{column, dir: asc|desc}]`, applied in order.
+        limit: Page size, clamped to [1, 1000].
+        offset: Page offset, >= 0.
+        count_only: Return `{count}` only (filters still apply).
+        distinct_column: Column name for distinct-value listing.
+        raw: Read the immutable base snapshot instead of the effective table.
+    """
     svc = _svc()
     try:
-        return _ok(svc.correction_add(dataset_key, op, anchor, values, actor=actor))
+        return _ok(
+            svc.query(
+                dataset_key,
+                filters=filters,
+                sort=sort,
+                limit=limit,
+                offset=offset,
+                count_only=count_only,
+                distinct_column=distinct_column,
+                raw=raw,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def aggregate(
+    dataset_key: str,
+    group_by: list,
+    measures: list,
+    filters: Optional[list] = None,
+    raw: bool = False,
+) -> dict:
+    """GROUP BY aggregation over a customer dataset: multi-column grouping ×
+    count/sum/avg/min/max measures, filter-compatible, group rows capped at
+    1,000 with exact group_count. sum/avg reject TEXT columns (honest type
+    guard); min/max allow any column. `raw=True` reads the base snapshot.
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+        group_by: Non-empty list of column names.
+        measures: `[{func, column?}]` — column required except for bare count.
+        filters: Same shape as `query` filters (AND-composed).
+        raw: Read the immutable base snapshot instead of the effective table.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.aggregate(dataset_key, group_by=group_by, measures=measures, filters=filters, raw=raw)
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def quality(dataset_key: str) -> dict:
+    """Quality snapshot for a customer dataset (wire-asset-catalog §3): row
+    count, computed_at, primary-key uniqueness and per-column sampled null
+    rates. Honest shapes: a dataset with no declared pk columns returns
+    `pk_declared=false` and `pk_uniqueness=null` (未声明键列 — no ratio is
+    invented); null rates are sampled (at most 10,000 rows, one scan) and
+    `sample_limit_hit=true` flags the cap. The payload carries ONLY aggregate
+    counts/ratios and names — never data values, sample rows or cell contents.
+    Read-only observation tool: no writes, no provenance events, no new
+    tables; the SQL is plain standard aggregates, dialect-neutral over the
+    cell's SQLite/PostgreSQL data root.
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+    """
+    svc = _svc()
+    try:
+        return _ok(svc.quality(dataset_key))
+    except Exception as e:
+        return _err(e)
+
+
+def correction_add(
+    dataset_key: str,
+    op: str,
+    anchor: Optional[str] = None,
+    values: Optional[dict] = None,
+    actor: str = "",
+    channel: str = "console",
+    actor_id: Optional[str] = None,
+    actor_label: Optional[str] = None,
+) -> dict:
+    """Add an overlay correction (update/delete/insert); it applies to the
+    effective table immediately and is replayed after every future commit.
+    Every edit record carries its write channel (console | data-key | agent)
+    for audit attribution."""
+    svc = _svc()
+    try:
+        return _ok(
+            svc.correction_add(
+                dataset_key,
+                op,
+                anchor,
+                values,
+                actor=actor,
+                channel=channel,
+                actor_id=actor_id,
+                actor_label=actor_label,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def write_batch(
+    dataset_key: str,
+    ops: list,
+    actor: str = "",
+    channel: str = "console",
+    actor_id: Optional[str] = None,
+    actor_label: Optional[str] = None,
+) -> dict:
+    """Business-write surface (wire-customer-data-engine §2): a list of edit
+    operations applied in ONE transaction (≤1,000 ops). Any rejected op rolls
+    the whole batch back — zero partial writes — and the error carries the
+    1-based index of the failing entry. Anchors are strict here: an
+    update/delete that matches no row rejects the batch (business writes must
+    hit their anchors; dangling is a connector-world outcome, not an app one).
+
+    Args:
+        dataset_key: Slug `^[a-z][a-z0-9_]{0,39}$`.
+        ops: `[{op: update|delete|insert, anchor?, values?}]` (same per-op
+            shape as correction_add).
+        actor: Human-readable actor label (audit).
+        channel: Write channel: console | data-key | agent.
+        actor_id: Structured actor identity (member id / key fingerprint / agent id).
+        actor_label: Display label for the actor.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.write_batch(
+                dataset_key,
+                ops,
+                actor=actor,
+                channel=channel,
+                actor_id=actor_id,
+                actor_label=actor_label,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def create_declared(
+    dataset_key: str,
+    columns: list,
+    pk_columns: Optional[list] = None,
+    name: Optional[str] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Schema-declared dataset creation: an EMPTY dataset from a column/type
+    declaration (optionally with primary-key columns that become the row
+    anchor), indistinguishable from an uploaded/connector-created dataset.
+    The app-first creation channel for business systems."""
+    svc = _svc()
+    try:
+        return _ok(
+            svc.create_declared(
+                dataset_key,
+                columns,
+                pk_columns=pk_columns,
+                name=name,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def add_column(dataset_key: str, column: dict, actor: str = "") -> dict:
+    """Add ONE nullable column to a dataset (effective + base tables and the
+    metadata). Additive-only schema evolution: destructive changes are not
+    offered. Rejected while an ingest is open."""
+    svc = _svc()
+    try:
+        return _ok(svc.add_column(dataset_key, column, actor=actor))
+    except Exception as e:
+        return _err(e)
+
+
+def derive(
+    child_key: str,
+    parent_key: str,
+    filters: Optional[list] = None,
+    sort: Optional[list] = None,
+    limit: Optional[int] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a structured-query result over `parent_key` into a NEW
+    child dataset, lineage recorded (parent + spec). The child inherits the
+    parent's columns and pk declaration. Re-derivation of an existing child
+    goes through `derive_refresh`."""
+    svc = _svc()
+    try:
+        return _ok(
+            svc.derive(
+                child_key,
+                parent_key,
+                filters=filters,
+                sort=sort,
+                limit=limit,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def join_indicators(
+    child_key: str,
+    parent_key: str,
+    indicators: list,
+    date_column: str,
+    region_column: Optional[str] = None,
+    default_entity: str = "中国",
+    filters: Optional[list] = None,
+    sort: Optional[list] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Derive a child dataset = customer rows × platform indicator series.
+    Series are fetched through the wire entrance with the cell's credential
+    (metered to this customer, same track as artifact materialization).
+    Matching: exact date → month period → year period (frequency inferred
+    from the series' own points); misses join as NULL — never neighbor
+    values. `region_column` (optional) resolves per-row entities by name;
+    without it every row uses `default_entity`. At most 10 indicator codes
+    per derivation and 64 distinct regions."""
+    svc = _svc()
+    try:
+        return _ok(
+            svc.join_indicators(
+                child_key,
+                parent_key,
+                indicators=indicators,
+                date_column=date_column,
+                region_column=region_column,
+                default_entity=default_entity,
+                filters=filters,
+                sort=sort,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def link(
+    child_key: str,
+    left_key: str,
+    left_column: str | list[str],
+    right_key: str,
+    right_column: str | list[str],
+    actor: str = "",
+    channel: str = "console",
+    junction_key: str = "",
+    junction_left_column: str | list[str] = "",
+    junction_right_column: str | list[str] = "",
+) -> dict:
+    """Materialize a LEFT JOIN of two datasets into a NEW child dataset:
+    left rows fully preserved, unmatched right columns NULL. Join keys are
+    declared per side (`left_column`/`right_column` — a single column name or
+    a list for composite keys). Column-name collisions get a `right_` prefix;
+    free right column names are kept. The child follows the same three-tier
+    layout/registration as derive/join, with lineage kind="link" recording
+    the right key and both key-column lists. Unknown dataset or key column
+    rejects the whole call (no partial child). Re-materialization of an
+    existing child goes through `derive_refresh`.
+
+    m:n 桥展开（wire-entity-mn-materialize）：给齐 junction 三要素
+    （junction_key / junction_left_column / junction_right_column）时改走
+    桥行驱动 INNER 对表——一条桥行一行结果、无桥关联端点行不入结果、
+    中间集列不进输出、孤儿桥以 ``orphan_dropped`` 计数如实上报；三要素
+    必须同给同缺。缺省时 n:1/1:1 行为逐字节等价。
+
+    Args:
+        child_key: Slug `^[a-z][a-z0-9_]{0,39}$` for the new child dataset.
+        left_key: Left dataset key (rows all preserved; lineage parent).
+        left_column: Left join column name, or list of names (composite).
+        right_key: Right dataset key (stored in the link spec).
+        right_column: Right join column name, or list of names (composite).
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label (console / data-key / agent).
+        junction_key: Junction dataset key (m:n bridge; optional).
+        junction_left_column: Junction column(s) pointing at the left keys.
+        junction_right_column: Junction column(s) pointing at the right keys.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.link(
+                child_key,
+                left_key,
+                left_column,
+                right_key,
+                right_column,
+                actor=actor,
+                channel=channel,
+                junction_key=junction_key,
+                junction_left_column=junction_left_column,
+                junction_right_column=junction_right_column,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def derive_refresh(child_key: str, actor: str = "") -> dict:
+    """Re-run a derived dataset's stored spec against its parent's current
+    effective state. Join derivations re-fetch their indicator series first
+    (metered reads again); operator (filter/aggregate/union/project) and SQL
+    derivations replay their archived spec verbatim."""
+    svc = _svc()
+    try:
+        return _ok(svc.derive_refresh(child_key, actor=actor))
+    except Exception as e:
+        return _err(e)
+
+
+# ── deterministic operators + SQL step (wire-transform-operators) ─────
+#
+# 工具名即 spec 冻结的契约（customer_dataset_filter / _project /
+# _aggregate_derive / _union / _sql / _sql_preview / _window），因此模块级
+# 函数名必须与之逐字一致。`filter` 由此遮蔽内建 filter()——本模块不依赖内建
+# filter（无一处裸调用，已核），这层遮蔽是工具名契约的代价，勿"顺手改名"。
+
+
+def filter(
+    child_key: str,
+    parent_key: str,
+    filters: Optional[list] = None,
+    sort: Optional[list] = None,
+    limit: Optional[int] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a filtered (optionally sorted/limited) subset of
+    `parent_key` into a NEW child dataset. Same filter/sort/limit semantics
+    as the query surface and as `derive` — the difference is lineage kind
+    `filter`, so pipelines and the dataset graph label this step truthfully
+    instead of calling it a generic derivation.
+
+    Args:
+        child_key: Slug `^[a-z][a-z0-9_]{0,39}$` for the new child dataset.
+        parent_key: Source dataset key.
+        filters: `[{column, op, value|values}]`, AND-composed. Operators:
+            eq/ne/gt/gte/lt/lte/in/notin/like/isnull/notnull/contains/startswith.
+        sort: `[{column, dir: asc|desc}]`.
+        limit: Row cap for the child (also bounded by the dataset row limit).
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label (console / data-key / agent).
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.filter_rows(
+                child_key,
+                parent_key,
+                filters=filters,
+                sort=sort,
+                limit=limit,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def project(
+    child_key: str,
+    parent_key: str,
+    columns: list,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a column projection (with renaming) into a NEW child
+    dataset. Output column order follows the declaration order. Primary-key
+    columns that are projected follow their new names; keys left out of the
+    projection are dropped (row anchoring then falls back to the row hash).
+
+    Args:
+        child_key: Slug for the new child dataset.
+        parent_key: Source dataset key.
+        columns: `[{source, as?}]` — `as` defaults to the source name;
+            duplicate output names reject the call.
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.project(
+                child_key, parent_key, columns=columns, actor=actor, channel=channel
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def aggregate_derive(
+    child_key: str,
+    parent_key: str,
+    group_by: list,
+    measures: list,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a GROUP BY result into a NEW child dataset (rows = groups,
+    columns = group keys + measures). This is the materializing counterpart of
+    the read-only `aggregate` tool: same validation and type guards, but the
+    output becomes a real dataset that downstream steps can build on.
+    sum/avg reject TEXT columns (honest type guard); min/max allow any column.
+
+    Args:
+        child_key: Slug for the new child dataset.
+        parent_key: Source dataset key.
+        group_by: 1..10 column names.
+        measures: 1..20 `[{func: count|sum|avg|min|max, column?}]` —
+            `column` required except for bare count. Output column names are
+            `count` (bare count) or `<func>__<column>`.
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.aggregate_derive(
+                child_key,
+                parent_key,
+                group_by=group_by,
+                measures=measures,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def union(
+    child_key: str,
+    left_key: str,
+    right_key: str,
+    on: str = "by_name",
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Append two datasets vertically into a NEW child dataset, aligning
+    columns by name: column set = union of both sides (first-seen order),
+    missing columns become NULL. Same-name columns with incompatible types
+    (TEXT vs numeric) are rejected honestly — never silently coerced;
+    INTEGER + REAL widens to REAL. The output has no primary key (append
+    semantics).
+
+    Args:
+        child_key: Slug for the new child dataset.
+        left_key: Left dataset key (lineage parent).
+        right_key: Right dataset key.
+        on: Alignment mode; v1 supports only "by_name".
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.union(
+                child_key,
+                left_key,
+                right_key,
+                on=on,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def window(
+    child_key: str,
+    parent_key: str,
+    partition_by: Optional[list] = None,
+    order_by: Optional[list] = None,
+    window: Optional[list] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a partitioned/ordered window computation over `parent_key`
+    into a NEW child dataset: source columns passed through unchanged plus one
+    column per `window` row (named by `as`). The row set is unchanged (windows
+    never add or drop rows); lineage kind `window` records the full spec so
+    `derive_refresh` replays it.
+
+    函数闭集（design D1）：row_number/rank/dense_rank 与 lag/lead 必须有
+    `order_by`（否则 422 指名函数）；lag/lead 的 `offset` 缺省 1、必须
+    1..10000；sum/avg/min/max 的 `column` 必填且 ⊆ 列快照，count 允许无
+    column（全行计数）。`as` 必须给出、唯一、且不与源列名冲突（422 指名，
+    不静默改名）。`frame ∈ whole_partition|running`（running 必须有
+    order_by；闭集，不开放任意边界语法）；frame 只对聚合类生效——行级函数
+    （row_number/rank/dense_rank/lag/lead）的取值与帧无关。
+
+    确定性（design D2）：内部 ORDER BY 末尾追加稳定行键 `__row_hash` 作
+    最终 tie-break，并列数据重派生逐行一致；`__row_hash` 与一切保留前缀列
+    绝不进输出列。
+
+    Args:
+        child_key: Slug `^[a-z][a-z0-9_]{0,39}$` for the new child dataset.
+        parent_key: Source dataset key.
+        partition_by: 0..10 column names (⊆ column snapshot); empty = one
+            global partition.
+        order_by: 0..10 `{column, dir: asc|desc}` — required by ranking funcs
+            and lag/lead, and by `frame=running`.
+        window: 1..20 `[{func, column?, offset?, as, frame?}]`.
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label (console / data-key / agent).
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.window_rows(
+                child_key,
+                parent_key,
+                partition_by=partition_by,
+                order_by=order_by,
+                window=window,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def sql_preview(
+    sql: str,
+    tables: list,
+    params: Optional[dict] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """Dry-run a read-only SQL step: returns at most 100 preview rows plus
+    the result-set schema and creates/refreshes NOTHING. Guardrails are
+    identical to `sql_derive` (single read-only statement, declared
+    placeholders only, literal parameter binding, dangerous functions
+    denied, read-only connection, timeout and row caps).
+
+    Args:
+        sql: SQL text referencing datasets as `{name}` placeholders.
+        tables: `[{name, dataset_key}]` — every placeholder must be declared,
+            and every declaration must be used.
+        params: `{name: value}` bound to `:name` placeholders (literals only;
+            values never enter the SQL text).
+        limit: Preview row cap (defaults to 100, never above 100).
+    """
+    svc = _svc()
+    try:
+        return _ok(svc.sql_query(sql, tables, params=params, limit=limit))
+    except Exception as e:
+        return _err(e)
+
+
+def sql(
+    child_key: str,
+    sql: str,
+    tables: list,
+    params: Optional[dict] = None,
+    actor: str = "",
+    channel: str = "console",
+) -> dict:
+    """Materialize a read-only SQL query into a NEW child dataset. The SQL
+    text, placeholder mapping and parameters are archived in lineage
+    (append-only) so the step can be replayed and audited; replay re-executes
+    the archived statement verbatim.
+
+    Read-only by construction: single statement starting with SELECT/WITH,
+    no DDL/DML/PRAGMA/ATTACH, dangerous functions denied, a sqlite authorizer
+    that denies anything but reads of the declared datasets, and the
+    connection itself opened in read-only mode. Results over the dataset row
+    limit reject the whole batch.
+
+    Args:
+        child_key: Slug for the new child dataset.
+        sql: SQL text referencing datasets as `{name}` placeholders.
+        tables: `[{name, dataset_key}]` — declared placeholders only.
+        params: `{name: value}` for `:name` placeholders (literals only).
+        actor: Who initiated the materialization (audit).
+        channel: Write channel label.
+    """
+    svc = _svc()
+    try:
+        return _ok(
+            svc.sql_derive(
+                child_key,
+                sql,
+                tables,
+                params=params,
+                actor=actor,
+                channel=channel,
+            )
+        )
+    except Exception as e:
+        return _err(e)
+
+
+def lineage(dataset_key: str) -> dict:
+    """Lineage of a dataset: its own derivation (parent + spec + last run)
+    and its live derived children."""
+    svc = _svc()
+    try:
+        return _ok(svc.lineage(dataset_key))
     except Exception as e:
         return _err(e)
 
@@ -875,5 +4244,69 @@ def delete(dataset_key: str, actor: str = "") -> dict:
     svc = _svc()
     try:
         return _ok(svc.delete(dataset_key, actor=actor))
+    except Exception as e:
+        return _err(e)
+
+
+# ── provenance WAL forwarder tools (wire-provenance-ledger D3) ───────
+
+
+def provenance_wal_pending(after_seq: int = 0, limit: int = 200) -> dict:
+    """Read un-forwarded WAL events for the platform-side provenance
+    forwarder: rows with ``acked = 0`` and ``seq > after_seq``, ascending by
+    ``seq`` (cursor style — hand the returned ``last_seq`` to
+    ``provenance_wal_ack``, then keep polling with it as ``after_seq``).
+    ``limit`` is clamped to [1, 1000]. Events stay readable until acked, so a
+    forwarder crash between read and ack loses nothing. On a database that
+    predates the WAL (table not yet created) returns an empty page.
+
+    Args:
+        after_seq: Exclusive lower seq bound (forwarder cursor).
+        limit: Max events per page, clamped to [1, 1000].
+    """
+    try:
+        after_seq = max(0, int(after_seq))
+        limit = max(1, min(int(limit), 1000))
+        with _tx() as cur:  # own transaction — never shares a business one
+            rows: list = []
+            if _wal_table_exists(cur):
+                rows = cur.execute(
+                    "SELECT seq, event_id, type, payload, created_at FROM cell_event_wal"
+                    " WHERE seq > ? AND acked = 0 ORDER BY seq ASC LIMIT ?",
+                    (after_seq, limit),
+                ).fetchall()
+        events = [
+            {
+                "seq": int(r[0]),
+                "event_id": r[1],
+                "type": r[2],
+                "payload": json.loads(r[3]),
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+        return {"events": events, "last_seq": events[-1]["seq"] if events else after_seq}
+    except Exception as e:
+        return _err(e)
+
+
+def provenance_wal_ack(upto_seq: int) -> dict:
+    """Ack WAL events up to and including ``upto_seq`` (forwarder confirms
+    they are durably in the platform ledger). Idempotent: re-acking returns
+    ``{"acked": 0}``. Flipping the ``acked`` bit is the only mutation the WAL
+    ever allows — tamper-proofing lives at the platform ledger, not here.
+
+    Args:
+        upto_seq: Highest seq to ack (typically pending's ``last_seq``).
+    """
+    try:
+        with _tx() as cur:  # own transaction — never shares a business one
+            if not _wal_table_exists(cur):
+                return {"acked": 0}
+            cur.execute(
+                "UPDATE cell_event_wal SET acked = 1 WHERE seq <= ? AND acked = 0",
+                (int(upto_seq),),
+            )
+            return {"acked": int(cur.rowcount)}
     except Exception as e:
         return _err(e)

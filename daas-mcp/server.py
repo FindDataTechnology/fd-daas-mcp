@@ -132,6 +132,7 @@ from process_api import (
     set_indicator_score,
     delete_indicator,
     run_indicator,
+    audit_indicators,
     calculate_indicator,
     cli_run_indicator,
 )
@@ -244,6 +245,7 @@ app.tool(update_indicator)
 app.tool(set_indicator_score)
 app.tool(delete_indicator)
 app.tool(run_indicator)
+app.tool(audit_indicators)
 app.tool(calculate_indicator)
 # customer-dataset tools live in their own group now (customer-dataset-mcp/,
 # profile `cell`) — the merged server loads them from there.

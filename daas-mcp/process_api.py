@@ -214,11 +214,24 @@ def run_indicator(name: str) -> dict:
     (date, value) into the daas `observations` table keyed on
     (source=datasource, function_name, indicator=indicator_name, date).
     Idempotent on re-run via the observations unique constraint.
+
+    A rule whose source table no longer exists returns an explicit error
+    naming the missing table (never a silent empty result).
     """
     try:
         return get_db().run_indicator(name)
     except (DbError, IndError) as e:
         return {"error": str(e)}
+
+
+def audit_indicators(disable: bool = False) -> dict:
+    """Audit indicator rules for dangling source tables.
+
+    Returns every rule whose `source_table` is absent from the database.
+    With `disable=True`, dangling rules are flipped to `enabled=0` (kept,
+    not deleted) so they stop appearing as runnable.
+    """
+    return get_db().audit_dangling_indicators(disable=disable)
 
 
 def calculate_indicator(

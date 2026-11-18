@@ -31,7 +31,6 @@ py-modules = [
     "process_tools",
     "process_database",
     "indicator_tools",
-    "migrate_process_cron",
 ]
 
 [tool.uv.sources]

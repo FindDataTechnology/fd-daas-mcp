@@ -10,4 +10,4 @@ Groups (core always-on unless the extra is absent): alerts, cron, composite,
 daas, dashboard, gateway, workflow, pdf, research.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

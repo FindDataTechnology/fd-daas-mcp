@@ -88,6 +88,18 @@ def _ratio(df, vc, params):
     return df[vc] / df[other]
 
 
+def _multiply(df, vc, params):
+    """Product of two columns (e.g. market cap = close * shares).
+
+    Mirrors `ratio`'s shape: `other_column` is required and validated
+    against the source table before any SQL runs.
+    """
+    other = params["other_column"]
+    if other not in df.columns:
+        raise IndicatorError(f"other_column not found in source table: {other}")
+    return df[vc] * df[other]
+
+
 def _level(df, vc, params):
     return df[vc].astype(float)
 
@@ -104,6 +116,7 @@ _OPS: dict[str, dict] = {
     "rsi": {"fn": _rsi, "required_params": ["window"], "description": "Wilder's RSI over `window` periods (0-100)."},
     "zscore": {"fn": _zscore, "required_params": ["window"], "description": "Rolling z-score over `window`."},
     "ratio": {"fn": _ratio, "required_params": ["other_column"], "description": "Ratio of value_column / other_column."},
+    "multiply": {"fn": _multiply, "required_params": ["other_column"], "description": "Product of value_column * other_column."},
     "level": {"fn": _level, "required_params": [], "description": "Passthrough: the raw value as float."},
 }
 
@@ -161,14 +174,20 @@ def calculate(
         validate_op(op, params)
     except IndicatorError as e:
         return {"error": str(e)}
+    other = (params or {}).get("other_column")
     try:
-        rows = db.fetch_indicator_series(source_table, date_column, value_column)
+        rows = db.fetch_indicator_series(
+            source_table, date_column, value_column, other_column=other
+        )
     except ProcessError as e:
         return {"error": str(e)}
     if not rows:
         return {"indicator": indicator_name or op, "dates": [], "values": [], "count": 0}
 
-    df = pd.DataFrame(rows, columns=[date_column, value_column])
+    if other is not None:
+        df = pd.DataFrame(rows, columns=[date_column, value_column, other])
+    else:
+        df = pd.DataFrame(rows, columns=[date_column, value_column])
     try:
         computed = compute_series(df, value_column, op, params)
     except IndicatorError as e:
