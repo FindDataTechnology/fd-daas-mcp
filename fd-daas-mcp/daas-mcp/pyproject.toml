@@ -2,9 +2,9 @@
 name = "daas-mcp"
 version = "0.1.0"
 description = "MCP server for DAAS multi-source data access, LLM extraction, and math indicators"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=2.0",
+    "fastmcp>=4.2.4,<5",
     "sqlalchemy>=2.0",
     "pandas>=1.0",
     "pyyaml>=6.0",

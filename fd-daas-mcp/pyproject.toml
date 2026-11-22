@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "FindDataOfficial" }]
 dependencies = [
-    "fastmcp>=3.4.2",
+    "fastmcp>=4.2.4,<5",
     "click>=8.0",
     "pandas>=1.0",
     "sqlalchemy>=2.0",
