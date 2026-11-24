@@ -18,6 +18,7 @@ from fastmcp import FastMCP
 from starlette.middleware import Middleware
 
 from daas.fd_daas_mcp import registry
+from daas.fd_daas_mcp.annotations import annotations_for
 
 REPO = Path(__file__).resolve().parents[3]  # repo root
 load_dotenv(REPO / ".env")
@@ -32,7 +33,30 @@ logger = logging.getLogger("fd-daas-mcp")
 # their own server.py) but those module-level FastMCP instances are never
 # served - their @app.tool decorator's only job is to attach the function
 # object to that module so registry.load_source() can extract it back out.
-app = FastMCP("fd-daas-mcp")
+app = FastMCP(
+    "fd-daas-mcp",
+    # 服务级路由知识（change mcp-surface-truth-up 3.1）。161 个工具按注册目录分成
+    # 8 组，前缀是**部署结构**（每个 `*-mcp/` 子包一组），不是业务分类——不写这段，
+    # 调用方会在 `cron_list_schedules` 之类的运维工具里找一个取数问题的答案。
+    # 只讲组之间的选择，不讲逐个参数（那是各工具 description 的事）。
+    instructions=(
+        "DaaS 数据面 + 工作区。161 个工具按 8 个前缀分组，前缀来自部署结构，**不是**业务分类。"
+        "先按下表选组，再在组内选工具。\n"
+        "• daas_（87 个）——日常取数只看这一组。浏览目录用 daas_list_*（sources / functions / "
+        "categories / entities / indicators）；模糊找用 daas_search_*（functions / datasources / "
+        "entities）；执行取数用 **daas_fetch_data**，它的 `function_name` 必须是 daas_search_functions "
+        "或 daas_list_sources 里真实出现过的名字。\n"
+        "• **daas_fetch_data 的第二个参数 `params_json` 是一个 JSON 字符串**（不是对象），"
+        "例如 '{\"country\": \"CHN\", \"time\": \"2020:2023\"}'——直接在 arguments 里传对象会被拒。\n"
+        "• cron_ / alerts_ / workflow_ 是调度与编排（建定时任务、告警规则、多步流程），"
+        "**不是取数入口**：问「某指标某天是多少」不该走它们；需要「每天自动刷新」时才用。\n"
+        "• dashboard_ 是看板构建（回答「给我一张图」）；composite_ / gateway_ / research_ 是元操作"
+        "（组合工具、跨服务网关、研究包），纯取数不需要它们。\n"
+        "• 修改注册表本身（create_/update_/delete_ 前缀）会改工作区状态，不是查询——"
+        "只有用户明确要求登记或改数据源时才调用。\n"
+        "• 用户问的是「有哪些数据」时用 daas_list_sources + daas_list_categories，不要猜函数名。"
+    ),
+)
 
 
 class BearerAuthMiddleware:
@@ -105,8 +129,11 @@ def _register_tools(profile: str | None) -> None:
         raise SystemExit(f"[fd-daas-mcp] {e}")
     _tools = registry.build(profile=profile)
     for _group, _name, _func in _tools:
+        _full = registry.namespaced(_group, _name)
         try:
-            app.tool(name=registry.namespaced(_group, _name))(_func)
+            # annotations 表按**完整注册名**（含组前缀）索引；未声明的名字抛
+            # KeyError 记进 note_failed，不静默注册成全 false（mcp-tool-annotations）。
+            app.tool(name=_full, annotations=annotations_for(_full))(_func)
         except Exception as e:  # noqa: BLE001 - record + keep going; surfaced via report
             registry.note_failed(_group, _name, f"{type(e).__name__}: {e}")
             logger.warning("failed to register %s_%s: %s", _group, _name, e)
