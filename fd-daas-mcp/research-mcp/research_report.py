@@ -54,14 +54,14 @@ def assemble_markdown(
     lines.append("## Entities")
     if entities:
         lines.append("")
-        lines.append("| Code | Name | Ticker | Exchange | Type |")
-        lines.append("|---|---|---|---|---|")
+        # Only the natural key survives locally (entities/entity_datasource_links
+        # were dropped; fd-open-data-mcp is the entity master). Emitting Name /
+        # Ticker / Exchange columns here would print three permanently empty
+        # columns — the report states what it actually has.
+        lines.append("| Code | Type |")
+        lines.append("|---|---|")
         for e in entities:
-            lines.append(
-                f"| {_fmt(e.get('code'))} | {_fmt(e.get('name'))} | "
-                f"{_fmt(e.get('ticker'))} | {_fmt(e.get('exchange'))} | "
-                f"{_fmt(e.get('entity_type'))} |"
-            )
+            lines.append(f"| {_fmt(e.get('code'))} | {_fmt(e.get('entity_type'))} |")
     else:
         lines.append("")
         lines.append("_No entity collection attached._")

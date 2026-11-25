@@ -295,6 +295,12 @@ def test_generate_report_writes_file_and_column(research_dir):
     row = sess.query(Research).filter_by(name="rep1").first()
     assert row.report_md == fpath.read_text(encoding="utf-8")
     assert "123.45" in row.report_md
+    # The entity table states only what the local store actually holds: the
+    # natural key and its type. Name/Ticker/Exchange columns would print
+    # permanently empty (entities tables were dropped; the gateway is the
+    # entity master) — a regression that put them back must fail here.
+    assert "| Code | Type |" in row.report_md
+    assert "500519" not in row.report_md
     sess.close()
     # regenerate overwrites (file + column stay consistent)
     g2 = research_tools.generate_report(name="rep1")
