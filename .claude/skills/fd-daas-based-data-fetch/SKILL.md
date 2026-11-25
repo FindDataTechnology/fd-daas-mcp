@@ -33,21 +33,21 @@ The `data-fetch` manifest takes:
 | `concept_id` | int | `gateway_call_data_mcp('fd-open-data-mcp','list_concepts', {entity_type})` |
 | `dates` | list[str] | user date range, ISO `YYYY-MM-DD` |
 
-## Step 2 — Run the manifest
+## Step 2 — Resolve, then read
+
+Two calls, both on `fd-open-data-mcp` (no server-side workflow):
 
 ```python
-workflow_run(name="data-fetch", params_json=json.dumps({
-    "entity_type": "stock",
-    "entity_id": 1,
-    "source": "yfinance",
-    "concept_id": 1,
-    "dates": ["2025-01-01", "2025-01-31"]
-}))
+gateway_call_data_mcp("fd-open-data-mcp", "resolve_entity",
+                      {"entity_type": "stock", "entity_id": 1, "source": "yfinance"})
+gateway_call_data_mcp("fd-open-data-mcp", "read",
+                      {"concept_id": 1, "entity_type": "stock", "entity_id": 1,
+                       "dates": ["2025-01-01", "2025-01-31"]})
 ```
 
-Returns `outputs`: `{"rows": [...], "identifier": "AAPL"}`. `rows` is the list
-of concept records read over `dates`; `identifier` is the source-mapping the
-`resolve` step resolved for the entity.
+`resolve_entity` returns the source-mapping `identifier` (e.g. `AAPL`); `read`
+returns the concept records over `dates`. Keep both — the identifier is the
+provenance you cite later, and `read` without a resolved entity is a guess.
 
 ## Step 3 — Checkpoint handling
 
@@ -80,10 +80,9 @@ fresh data.
 
 ## Hard rules
 
-- **Fetch goes through `workflow_run("data-fetch", …)`.** No direct `sqlite3`
-  entity resolution, no `scripts/dispatch.py`, no
-  `uv run --with akshare/yfinance/…` direct library import. The manifest owns
-  resolve→fetch; this skill owns param gathering + optional persist.
+- **Fetch is two gateway calls: `resolve_entity` then `read`.** No direct
+  `sqlite3` entity resolution, no `scripts/dispatch.py`, no
+  `uv run --with akshare/yfinance/…` direct library import.
 - **Persist via `scripts/upsert.py`** (scraw) or the `indicators` manifest
   (observations). Back up `daas.db` before bulk writes (upsert.py does this).
 - **Validate dynamic identifiers** against `^[A-Za-z_][A-Za-z0-9_]*$` before

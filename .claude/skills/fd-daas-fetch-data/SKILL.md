@@ -75,12 +75,14 @@ The manifest runs `daas_run_indicator` (the math + source-table read +
 and persists it:
 
 ```python
-workflow_run(name="indicators", params_json=json.dumps({"name": "spy_ma5"}))
+daas_run_indicator(name="spy_ma5")
 ```
 
-Returns `outputs`: `{"result": <daas_run_indicator return>}`. The run does a
-full recompute (windowed ops need lookback) and upserts into `observations`
-keyed on `(source, function_name, indicator, date)` — idempotent on re-run.
+Returns the tool's own result (rows written, or an explicit error naming a
+dangling source table). One call replaces the retired `indicators` manifest,
+which was a single-step wrapper around exactly this tool. The run does a full
+recompute (windowed ops need lookback) and upserts into `observations` keyed on
+`(source, function_name, indicator, date)` — idempotent on re-run.
 
 ## Step 4 — Checkpoint handling
 
@@ -113,7 +115,7 @@ count}` and writes nothing.
 - **Indicator-rule creation goes through `daas_create_indicator`.** No
   `INSERT INTO indicator_rules`. The tool validates datasource + table +
   columns + op before inserting.
-- **Compute + persist goes through `workflow_run("indicators", …)`.** No
+- **Compute + persist goes through `daas_run_indicator`.** No
   `scripts/run_indicator.py`. For ad-hoc (no persist), use
   `daas_calculate_indicator`.
 - **Validate dynamic identifiers** against `^[A-Za-z_][A-Za-z0-9_]*$` before

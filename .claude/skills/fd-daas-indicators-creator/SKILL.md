@@ -28,7 +28,7 @@ If both yes -> skip to step 4. If not -> invoke `fd-daas-fetch-data` first, then
 
 ## Step 4 - Create the storage table + save the data
 
-Goal: create `scraw_<slug>` and upsert the fetched rows into it. The fetch itself goes through the `data-fetch` workflow manifest (`workflow_run("data-fetch", …)` in `fd-daas-based-data-fetch`), then persist via `upsert.py`.
+Goal: create `scraw_<slug>` and upsert the fetched rows into it. The fetch itself is two `fd-open-data-mcp` gateway calls (`resolve_entity` then `read`, see `fd-daas-based-data-fetch`), then persist via `upsert.py`.
 
 1. Derive a `scraw_<slug>` name (kebab, `^[A-Za-z_][A-Za-z0-9_]*$`). Create the table on first upsert - `upsert.py` auto-`CREATE TABLE` + `ALTER TABLE ADD COLUMN` for new columns:
    ```bash

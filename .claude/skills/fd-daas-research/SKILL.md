@@ -1,16 +1,14 @@
 ---
 name: fd-daas-research
-description: Run a daas research study by executing the registered `research` workflow manifest, which searches concepts via fd-open-data-mcp, persists a research bundle, and generates a markdown report. Use when the user wants a full research pipeline (entity -> indicators -> dashboard -> report). Returns the research handle + report path. No direct component delegation, no direct sqlite3 plan context.
+description: Local entry to a daas research study. Point the caller at the research-workflow pack skill (which owns the five stages and their judgements), then handle parameter collection and result surfacing. Use when the user wants a full research pipeline (entity -> indicators -> report). No server-side workflow; no direct sqlite3 plan context.
 ---
 
-# fd-daas-research (thin shell)
+# fd-daas-research (local entry)
 
-Run a research study by running the `research` workflow manifest. The manifest
-owns concept search -> `research_create` -> `research_generate_report` over
-fd-open-data-mcp + fd-daas-mcp; this skill gathers params, runs the manifest,
-handles checkpoints, and surfaces the report. No delegated creator-skill
-invocation, no direct `sqlite3` plan context, no direct `research_*` MCP calls
-— those moved behind the manifest.
+This is the **local development entry**, not the execution flow. The research
+stages and their judgements live in the `research-workflow` pack skill (pack
+「数据 · 自助分析」). Read that skill's body and follow it; this file only adds
+what is local-host specific.
 
 ## When to use
 
@@ -22,9 +20,7 @@ Do NOT use for: a one-shot fetch (`fd-daas-based-data-fetch`), only indicators
 (`fd-daas-indicators-creator`), only a dashboard (`fd-daas-dashboard-creator`),
 or only an entity collection (`fd-daas-entities-collection-creator`).
 
-## Step 1 — Gather params
-
-The `research` manifest takes:
+## Step 1 — Collect params
 
 | param | type | how to discover |
 |-------|------|-----------------|
@@ -32,58 +28,43 @@ The `research` manifest takes:
 | `query` | str (natural-language demand) | user demand verbatim |
 | `limit` | int | default 10; raise for broader concept search |
 
-## Step 2 — Run the manifest
+## Step 2 — Execute per `research-workflow`
 
-```python
-workflow_run(name="research", params_json=json.dumps({
-    "name": "byd-trend",
-    "query": "比亚迪 趋势 价格 指标",
-    "limit": 10
-}))
-```
+Follow the pack skill's five stages: frame the question → search and select →
+backfill data → build bundle and report → decide whether to promote outward.
+The judgements (which hits to keep, whether there is enough data to continue)
+are **yours to make at each step**; do not reduce the stages to a fixed script.
 
-Returns `outputs`: `{"concepts": [...], "research": {...}, "report": {...}}`.
-`concepts` is the ai_search result list; `research` is the created bundle row;
-`report` carries the `report_path` (`researches/<name>.md`).
+Tools are the `fd-open-data-mcp` reads (`ai_search`, `read`, `read_series`)
+and the `fd-daas-mcp` research/collection tools. Call them directly.
 
-## Step 3 — Checkpoint handling
+## Step 3 — Surface the result
 
-If `status` is `paused`, the manifest hit a `type: checkpoint` step. Inspect
-the `resume_token` + the sentinel step at `sort_order=0`, decide, then:
+Tell the user the research name + the report path. On a repeat demand whose
+research already exists, call `research_refresh(name="<name>")` then
+`research_generate_report(name="<name>")` — do **not** re-create the bundle
+(`research_create` returns an error on an existing name).
 
-```python
-workflow_resume(run_id=<run_id>, approved=True)   # approved=False marks the run failed
-```
-
-`workflow_inspect(name="research")` shows the validated step plan without
-executing — use it to preview before a run.
-
-## Step 4 — Surface the result
-
-Tell the user the research name + the returned `report_path`. On a repeat
-demand whose research already exists, re-run Step 2 — `research_create`
-upserts the bundle and `research_generate_report` regenerates the markdown.
-
-For a full indicator recompute (re-run the indicator math + sync rule-based
-collections), call `research_refresh(name="<name>")` as a follow-up; the
-manifest itself only creates + reports, it does not invoke refresh.
+**Legacy note.** Older deployments may still carry a `research` row in their
+local `workflows` table (`workflow_run("research", …)`). That path is retired:
+it never wired the search results into the bundle and failed on re-run. If
+`research_create` / `research_refresh` are unavailable, tell the user to
+upgrade to pack 「数据 · 自助分析」 (which ships `research-workflow`) rather
+than falling back to the old manifest.
 
 **Run-notification** — emit at the end:
 
     ## Run Complete
     **Skill:** fd-daas-research
-    **Status:** research manifest run + reported
+    **Status:** research study run + reported
     **Produced:** research `<name>` -> `researches/<name>.md`
     **Next:** re-run anytime to refresh; `research_refresh` to recompute indicators.
 
 ## Hard rules
 
-- **Orchestration goes through `workflow_run("research", …)`.** No direct
-  `research_*` MCP calls, no delegated creator-skill invocation, no direct
-  `sqlite3` plan context. The manifest owns search -> create -> report; this
-  skill owns param gathering + result surfacing.
-- **No standalone fetch step** — wiring concept_id generically out of
-  ai_search's list result needs list-index interpolation the manifest engine
-  doesn't support; fetch is folded into `research_refresh` (run separately on
-  repeat demands to recompute indicators), not the manifest.
-- **No cron by default.** Re-run Step 2 to refresh the report.
+- **The stages and judgements come from `research-workflow`.** This file owns
+  only param gathering + result surfacing; it does not carry a second copy of
+  the flow (two copies drift).
+- **No empty bundle, no empty report.** A research with no entity or indicator
+  member must not be reported as a study (see `research-workflow` 阶段 4).
+- **No cron by default.** Re-run to refresh the report.
