@@ -1,7 +1,7 @@
 # Research: us-leaders-trend
 
 - **Status:** draft
-- **Generated:** 2026-07-23T13:31:15.233395+00:00
+- **Generated:** 2026-11-25T12:51:30.521455+00:00
 
 Livermore×O'Neil 美股强势股趋势监控研究包. 动态池A (S&P500 top300成交额筛出 × 7/20/60/120日涨幅Top5并集) + SPY/QQQ基准. 组件: us_leadership_pool 实体集合(17只动态池A) / us-leaders-indicators 指标集合(324规则,54标的) / us-leaders-trend-monitor 看板 / 12飞书预警代理. 2026-07-23 刷新: 数据至 2026-07-22, poolA 换血6只(新增 ABT/CTAS/HPE/SMCI/TRV/VLO; 剔除 AXON/CBOE/FTNT/META/MRNA/STX). 详细分析(缺口/决策/延后工作)见 construction/leaders-strategy-roadmap.md.
 
@@ -9,23 +9,23 @@ Livermore×O'Neil 美股强势股趋势监控研究包. 动态池A (S&P500 top30
 
 | Code | Name | Ticker | Exchange | Type |
 |---|---|---|---|---|
-| DDOG | DDOG | DDOG |  | stock |
-| DELL | DELL | DELL |  | stock |
-| HUM | HUM | HUM |  | stock |
-| MPC | MPC | MPC |  | stock |
-| MRVL | MRVL | MRVL |  | stock |
-| MU | MU | MU |  | stock |
-| PANW | PANW | PANW |  | stock |
-| PSX | PSX | PSX |  | stock |
-| PYPL | PYPL | PYPL |  | stock |
-| SNDK | SNDK | SNDK |  | stock |
-| TECH | TECH | TECH |  | stock |
-| SMCI | SMCI | SMCI |  | stock |
-| ABT | ABT | ABT |  | stock |
-| HPE | HPE | HPE |  | stock |
-| VLO | VLO | VLO |  | stock |
-| TRV | TRV | TRV |  | stock |
-| CTAS | CTAS | CTAS |  | stock |
+| DDOG |  |  |  | stock |
+| DELL |  |  |  | stock |
+| HUM |  |  |  | stock |
+| MPC |  |  |  | stock |
+| MRVL |  |  |  | stock |
+| MU |  |  |  | stock |
+| PANW |  |  |  | stock |
+| PSX |  |  |  | stock |
+| PYPL |  |  |  | stock |
+| SNDK |  |  |  | stock |
+| TECH |  |  |  | stock |
+| SMCI |  |  |  | stock |
+| ABT |  |  |  | stock |
+| HPE |  |  |  | stock |
+| VLO |  |  |  | stock |
+| TRV |  |  |  | stock |
+| CTAS |  |  |  | stock |
 
 ## Indicators
 
